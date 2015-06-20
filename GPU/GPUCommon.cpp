@@ -1,9 +1,10 @@
 #include <algorithm>
 #include "native/base/mutex.h"
 #include "native/base/timeutil.h"
-#include "GeDisasm.h"
-#include "GPUCommon.h"
-#include "GPUState.h"
+#include "Common/ColorConv.h"
+#include "GPU/GeDisasm.h"
+#include "GPU/GPUCommon.h"
+#include "GPU/GPUState.h"
 #include "ChunkFile.h"
 #include "Core/Config.h"
 #include "Core/CoreTiming.h"
@@ -21,6 +22,7 @@ GPUCommon::GPUCommon() :
 	dumpThisFrame_(false)
 {
 	Reinitialize();
+	SetupColorConv();
 	SetThreadEnabled(g_Config.bSeparateCPUThread);
 }
 
@@ -69,7 +71,7 @@ bool GPUCommon::BusyDrawing() {
 }
 
 u32 GPUCommon::DrawSync(int mode) {
-	if (g_Config.bSeparateCPUThread) {
+	if (ThreadEnabled()) {
 		// Sync first, because the CPU is usually faster than the emulated GPU.
 		SyncThread();
 	}
@@ -124,7 +126,7 @@ void GPUCommon::CheckDrawSync() {
 }
 
 int GPUCommon::ListSync(int listid, int mode) {
-	if (g_Config.bSeparateCPUThread) {
+	if (ThreadEnabled()) {
 		// Sync first, because the CPU is usually faster than the emulated GPU.
 		SyncThread();
 	}
@@ -210,6 +212,7 @@ u32 GPUCommon::EnqueueList(u32 listpc, u32 stall, int subIntrBase, PSPPointer<Ps
 
 	int id = -1;
 	u64 currentTicks = CoreTiming::GetTicks();
+	u32_le stackAddr = args.IsValid() ? args->stackAddr : 0;
 	// Check compatibility
 	if (sceKernelGetCompiledSdkVersion() > 0x01FFFFFF) {
 		//numStacks = 0;
@@ -220,6 +223,9 @@ u32 GPUCommon::EnqueueList(u32 listpc, u32 stall, int subIntrBase, PSPPointer<Ps
 				// Exit enqueues right after an END, which fails without ignoring pendingInterrupt lists.
 				if (dls[i].pc == listpc && !dls[i].pendingInterrupt) {
 					ERROR_LOG(G3D, "sceGeListEnqueue: can't enqueue, list address %08X already used", listpc);
+					return 0x80000021;
+				} else if (stackAddr != 0 && dls[i].stackAddr == stackAddr && !dls[i].pendingInterrupt) {
+					ERROR_LOG(G3D, "sceGeListEnqueue: can't enqueue, stack address %08X already used", stackAddr);
 					return 0x80000021;
 				}
 			}
@@ -266,6 +272,7 @@ u32 GPUCommon::EnqueueList(u32 listpc, u32 stall, int subIntrBase, PSPPointer<Ps
 	dl.started = false;
 	dl.offsetAddr = 0;
 	dl.bboxResult = false;
+	dl.stackAddr = stackAddr;
 
 	if (args.IsValid() && args->context.IsValid())
 		dl.context = args->context;
@@ -528,6 +535,8 @@ bool GPUCommon::InterpretList(DisplayList &list) {
 		}
 	}
 
+	FinishDeferred();
+
 	// We haven't run the op at list.pc, so it shouldn't count.
 	if (cycleLastPC != list.pc) {
 		UpdatePC(list.pc - 4, list.pc);
@@ -564,8 +573,8 @@ void GPUCommon::SlowRunLoop(DisplayList &list)
 			} else {
 				prev = 0;
 			}
-			GeDisassembleOp(list.pc, op, prev, temp);
-			NOTICE_LOG(G3D, "%s", temp);
+			GeDisassembleOp(list.pc, op, prev, temp, 256);
+			NOTICE_LOG(G3D, "%08x: %s", op, temp);
 		}
 		gstate.cmdmem[cmd] = op;
 
@@ -682,7 +691,7 @@ void GPUCommon::ProcessDLQueueInternal() {
 
 	for (int listIndex = GetNextListIndex(); listIndex != -1; listIndex = GetNextListIndex()) {
 		DisplayList &l = dls[listIndex];
-		DEBUG_LOG(G3D, "Okay, starting DL execution at %08x - stall = %08x", l.pc, l.stall);
+		DEBUG_LOG(G3D, "Starting DL execution at %08x - stall = %08x", l.pc, l.stall);
 		if (!InterpretList(l)) {
 			return;
 		} else {
@@ -751,6 +760,10 @@ void GPUCommon::Execute_Call(u32 op, u32 diff) {
 	// Saint Seiya needs correct support for relative calls.
 	const u32 retval = currentList->pc + 4;
 	const u32 target = gstate_c.getRelativeAddress(op & 0x00FFFFFC);
+	if (!Memory::IsValidAddress(target)) {
+		ERROR_LOG_REPORT(G3D, "CALL to illegal address %08x - ignoring! data=%06x", target, op & 0x00FFFFFF);
+		return;
+	}
 
 	// Bone matrix optimization - many games will CALL a bone matrix (!).
 	if ((Memory::ReadUnchecked_U32(target) >> 24) == GE_CMD_BONEMATRIXDATA) {
@@ -765,8 +778,6 @@ void GPUCommon::Execute_Call(u32 op, u32 diff) {
 
 	if (currentList->stackptr == ARRAY_SIZE(currentList->stack)) {
 		ERROR_LOG_REPORT(G3D, "CALL: Stack full!");
-	} else if (!Memory::IsValidAddress(target)) {
-		ERROR_LOG_REPORT(G3D, "CALL to illegal address %08x - ignoring! data=%06x", target, op & 0x00FFFFFF);
 	} else {
 		auto &stackEntry = currentList->stack[currentList->stackptr++];
 		stackEntry.pc = retval;
@@ -1003,7 +1014,7 @@ void GPUCommon::FastLoadBoneMatrix(u32 target) {
 	gstate.FastLoadBoneMatrix(target);
 }
 
-struct DisplayListOld {
+struct DisplayList_v1 {
 	int id;
 	u32 startpc;
 	u32 pc;
@@ -1024,20 +1035,49 @@ struct DisplayListOld {
 	bool bboxResult;
 };
 
+struct DisplayList_v2 {
+	int id;
+	u32 startpc;
+	u32 pc;
+	u32 stall;
+	DisplayListState state;
+	SignalBehavior signal;
+	int subIntrBase;
+	u16 subIntrToken;
+	DisplayListStackEntry stack[32];
+	int stackptr;
+	bool interrupted;
+	u64 waitTicks;
+	bool interruptsEnabled;
+	bool pendingInterrupt;
+	bool started;
+	PSPPointer<u32_le> context;
+	u32 offsetAddr;
+	bool bboxResult;
+};
+
 void GPUCommon::DoState(PointerWrap &p) {
 	easy_guard guard(listLock);
 
-	auto s = p.Section("GPUCommon", 1, 2);
+	auto s = p.Section("GPUCommon", 1, 3);
 	if (!s)
 		return;
 
 	p.Do<int>(dlQueue);
-	if (s >= 2) {
+	if (s >= 3) {
 		p.DoArray(dls, ARRAY_SIZE(dls));
+	} else if (s >= 2) {
+		for (size_t i = 0; i < ARRAY_SIZE(dls); ++i) {
+			DisplayList_v2 oldDL;
+			p.Do(oldDL);
+			// Copy over everything except the last, new member (stackAddr.)
+			memcpy(&dls[i], &oldDL, sizeof(DisplayList_v2));
+			dls[i].stackAddr = 0;
+		}
 	} else {
 		// Can only be in read mode here.
 		for (size_t i = 0; i < ARRAY_SIZE(dls); ++i) {
-			DisplayListOld oldDL;
+			DisplayList_v1 oldDL;
 			p.Do(oldDL);
 			// On 32-bit, they're the same, on 64-bit oldDL is bigger.
 			memcpy(&dls[i], &oldDL, sizeof(DisplayList));
@@ -1045,6 +1085,7 @@ void GPUCommon::DoState(PointerWrap &p) {
 			dls[i].context = 0;
 			dls[i].offsetAddr = oldDL.offsetAddr;
 			dls[i].bboxResult = oldDL.bboxResult;
+			dls[i].stackAddr = 0;
 		}
 	}
 	int currentID = 0;
@@ -1154,7 +1195,7 @@ void GPUCommon::ResetListState(int listID, DisplayListState state) {
 
 GPUDebugOp GPUCommon::DissassembleOp(u32 pc, u32 op) {
 	char buffer[1024];
-	GeDisassembleOp(pc, op, Memory::Read_U32(pc - 4), buffer);
+	GeDisassembleOp(pc, op, Memory::Read_U32(pc - 4), buffer, sizeof(buffer));
 
 	GPUDebugOp info;
 	info.pc = pc;
@@ -1173,7 +1214,7 @@ std::vector<GPUDebugOp> GPUCommon::DissassembleOpRange(u32 startpc, u32 endpc) {
 	u32 prev = Memory::IsValidAddress(startpc - 4) ? Memory::Read_U32(startpc - 4) : 0;
 	for (u32 pc = startpc; pc < endpc; pc += 4) {
 		u32 op = Memory::IsValidAddress(pc) ? Memory::Read_U32(pc) : 0;
-		GeDisassembleOp(pc, op, prev, buffer);
+		GeDisassembleOp(pc, op, prev, buffer, sizeof(buffer));
 		prev = op;
 
 		info.pc = pc;

@@ -17,18 +17,21 @@
 
 #include <WinNls.h>
 #include <math.h>
+#include <Wbemidl.h>
 
 #include "Common/CommonWindows.h"
 
 #include "file/vfs.h"
 #include "file/zip_read.h"
 #include "base/NativeApp.h"
+#include "profiler/profiler.h"
 #include "thread/threadutil.h"
 #include "util/text/utf8.h"
 
 #include "Core/Config.h"
 #include "Core/SaveState.h"
 #include "Windows/EmuThread.h"
+#include "Windows/DSoundStream.h"
 #include "ext/disarm.h"
 
 #include "Common/LogManager.h"
@@ -67,9 +70,7 @@ CMemoryDlg *memoryWindow[MAX_CPUCOUNT] = {0};
 
 static std::string langRegion;
 static std::string osName;
-
-typedef BOOL(WINAPI *isProcessDPIAwareProc)();
-typedef BOOL(WINAPI *setProcessDPIAwareProc)();
+static std::string gpuDriverVersion;
 
 void LaunchBrowser(const char *url) {
 	ShellExecute(NULL, L"open", ConvertUTF8ToWString(url).c_str(), NULL, NULL, SW_SHOWNORMAL);
@@ -158,7 +159,71 @@ std::string GetWindowsSystemArchitecture() {
 		return "(Unknown)";
 }
 
+// Adapted mostly as-is from http://www.gamedev.net/topic/495075-how-to-retrieve-info-about-videocard/?view=findpost&p=4229170
+// so credit goes to that post's author, and in turn, the author of the site mentioned in that post (which seems to be down?).
+std::string GetVideoCardDriverVersion() {
+	std::string retvalue = "";
+
+	HRESULT hr;
+	hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+	if (FAILED(hr)) {
+		return retvalue;
+	}
+
+	IWbemLocator *pIWbemLocator = NULL;
+	hr = CoCreateInstance(__uuidof(WbemLocator), NULL, CLSCTX_INPROC_SERVER, 
+		__uuidof(IWbemLocator), (LPVOID *)&pIWbemLocator);
+	if (FAILED(hr)) {
+		CoUninitialize();
+		return retvalue;
+	}
+
+	BSTR bstrServer = SysAllocString(L"\\\\.\\root\\cimv2");
+	IWbemServices *pIWbemServices;
+	hr = pIWbemLocator->ConnectServer(bstrServer, NULL, NULL, 0L, 0L, NULL,	NULL, &pIWbemServices);
+	if (FAILED(hr)) {
+		pIWbemLocator->Release();
+		SysFreeString(bstrServer);
+		CoUninitialize();
+		return retvalue;
+	}
+
+	hr = CoSetProxyBlanket(pIWbemServices, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, 
+		NULL, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, NULL,EOAC_DEFAULT);
+	
+	BSTR bstrWQL = SysAllocString(L"WQL");
+	BSTR bstrPath = SysAllocString(L"select * from Win32_VideoController");
+	IEnumWbemClassObject* pEnum;
+	hr = pIWbemServices->ExecQuery(bstrWQL, bstrPath, WBEM_FLAG_FORWARD_ONLY, NULL, &pEnum);
+
+	ULONG uReturned;
+	VARIANT var;
+	IWbemClassObject* pObj = NULL;
+	if (!FAILED(hr)) {
+		hr = pEnum->Next(WBEM_INFINITE, 1, &pObj, &uReturned);
+	}
+
+	if (!FAILED(hr) && uReturned) {
+		hr = pObj->Get(L"DriverVersion", 0, &var, NULL, NULL);
+		if (SUCCEEDED(hr)) {
+			char str[MAX_PATH];
+			WideCharToMultiByte(CP_ACP, 0, var.bstrVal, -1, str, sizeof(str), NULL, NULL);
+			retvalue = str;
+		}
+	}
+
+	pEnum->Release();
+	SysFreeString(bstrPath);
+	SysFreeString(bstrWQL);
+	pIWbemServices->Release();
+	pIWbemLocator->Release();
+	SysFreeString(bstrServer);
+	CoUninitialize();
+	return retvalue;
+}
+
 std::string System_GetProperty(SystemProperty prop) {
+	static bool hasCheckedGPUDriverVersion = false;
 	switch (prop) {
 	case SYSPROP_NAME:
 		return osName;
@@ -179,13 +244,29 @@ std::string System_GetProperty(SystemProperty prop) {
 			}
 			return retval;
 		}
+	case SYSPROP_GPUDRIVER_VERSION:
+		if (!hasCheckedGPUDriverVersion) {
+			hasCheckedGPUDriverVersion = true;
+			gpuDriverVersion = GetVideoCardDriverVersion();
+		}
+		return gpuDriverVersion;
 	default:
 		return "";
 	}
 }
 
+// Ugly!
+extern WindowsAudioBackend *winAudioBackend;
+
 int System_GetPropertyInt(SystemProperty prop) {
-  return -1;
+	switch (prop) {
+	case SYSPROP_AUDIO_SAMPLE_RATE:
+		return winAudioBackend ? winAudioBackend->GetSampleRate() : -1;
+	case SYSPROP_DISPLAY_REFRESH_RATE:
+		return 60000;
+	default:
+		return -1;
+	}
 }
 
 void System_SendMessage(const char *command, const char *parameter) {
@@ -205,25 +286,24 @@ void System_SendMessage(const char *command, const char *parameter) {
 	}
 }
 
-void EnableCrashingOnCrashes() { 
-  typedef BOOL (WINAPI *tGetPolicy)(LPDWORD lpFlags); 
-  typedef BOOL (WINAPI *tSetPolicy)(DWORD dwFlags); 
-  const DWORD EXCEPTION_SWALLOWING = 0x1;
+void EnableCrashingOnCrashes() {
+	typedef BOOL (WINAPI *tGetPolicy)(LPDWORD lpFlags);
+	typedef BOOL (WINAPI *tSetPolicy)(DWORD dwFlags);
+	const DWORD EXCEPTION_SWALLOWING = 0x1;
 
-  HMODULE kernel32 = LoadLibrary(L"kernel32.dll");
-  tGetPolicy pGetPolicy = (tGetPolicy)GetProcAddress(kernel32, 
-    "GetProcessUserModeExceptionPolicy"); 
-  tSetPolicy pSetPolicy = (tSetPolicy)GetProcAddress(kernel32, 
-    "SetProcessUserModeExceptionPolicy"); 
-  if (pGetPolicy && pSetPolicy) 
-  { 
-    DWORD dwFlags; 
-    if (pGetPolicy(&dwFlags)) 
-    { 
-      // Turn off the filter 
-      pSetPolicy(dwFlags & ~EXCEPTION_SWALLOWING); 
-    } 
-  } 
+	HMODULE kernel32 = LoadLibrary(L"kernel32.dll");
+	tGetPolicy pGetPolicy = (tGetPolicy)GetProcAddress(kernel32,
+		"GetProcessUserModeExceptionPolicy");
+	tSetPolicy pSetPolicy = (tSetPolicy)GetProcAddress(kernel32,
+		"SetProcessUserModeExceptionPolicy");
+	if (pGetPolicy && pSetPolicy) {
+		DWORD dwFlags;
+		if (pGetPolicy(&dwFlags)) {
+			// Turn off the filter.
+			pSetPolicy(dwFlags & ~EXCEPTION_SWALLOWING);
+		}
+	}
+	FreeLibrary(kernel32);
 }
 
 bool System_InputBoxGetString(const char *title, const char *defaultValue, char *outValue, size_t outLength)
@@ -246,30 +326,24 @@ bool System_InputBoxGetWString(const wchar_t *title, const std::wstring &default
 	}
 }
 
-void MakePPSSPPDPIAware()
-{
-	isProcessDPIAwareProc isDPIAwareProc = (isProcessDPIAwareProc) 
-		GetProcAddress(GetModuleHandle(TEXT("User32.dll")), "IsProcessDPIAware");
 
-	setProcessDPIAwareProc setDPIAwareProc = (setProcessDPIAwareProc)
-		GetProcAddress(GetModuleHandle(TEXT("User32.dll")), "SetProcessDPIAware");
+std::vector<std::wstring> GetWideCmdLine() {
+	wchar_t **wargv;
+	int wargc = -1;
+	wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
 
-	// If we're not DPI aware, make it so, but do it safely.
-	if (isDPIAwareProc != nullptr) {
-		if (!isDPIAwareProc()) {
-			if (setDPIAwareProc != nullptr)
-				setDPIAwareProc();
-		}
-	}
+	std::vector<std::wstring> wideArgs(wargv, wargv + wargc);
+
+	return wideArgs;
 }
 
 int WINAPI WinMain(HINSTANCE _hInstance, HINSTANCE hPrevInstance, LPSTR szCmdLine, int iCmdShow)
 {
 	setCurrentThreadName("Main");
 
-	// Windows Vista and above: alert Windows that PPSSPP is DPI aware,
-	// so that we don't flicker in fullscreen on some PCs.
-	MakePPSSPPDPIAware();
+	CoInitializeEx(NULL, COINIT_MULTITHREADED);
+
+	PROFILE_INIT();
 
 	// FMA3 support in the 2013 CRT is broken on Vista and Windows 7 RTM (fixed in SP1). Just disable it.
 #ifdef _M_X64
@@ -314,23 +388,28 @@ int WINAPI WinMain(HINSTANCE _hInstance, HINSTANCE hPrevInstance, LPSTR szCmdLin
 
 	osName = GetWindowsVersion() + " " + GetWindowsSystemArchitecture();
 
-	const char *configFilename = NULL;
-	const char *configOption = "--config=";
+	char configFilename[MAX_PATH] = { 0 };
+	const std::wstring configOption = L"--config=";
 
-	const char *controlsConfigFilename = NULL;
-	const char *controlsOption = "--controlconfig=";
+	char controlsConfigFilename[MAX_PATH] = { 0 };
+	const std::wstring controlsOption = L"--controlconfig=";
 
-	for (int i = 1; i < __argc; ++i)
-	{
-		if (__argv[i][0] == '\0')
+	std::vector<std::wstring> wideArgs = GetWideCmdLine();
+
+	for (size_t i = 1; i < wideArgs.size(); ++i) {
+		if (wideArgs[i][0] == L'\0')
 			continue;
-		if (__argv[i][0] == '-')
-		{
-			if (!strncmp(__argv[i], configOption, strlen(configOption)) && strlen(__argv[i]) > strlen(configOption)) {
-				configFilename = __argv[i] + strlen(configOption);
+		if (wideArgs[i][0] == L'-') {
+			if (wideArgs[i].find(configOption) != std::wstring::npos && wideArgs[i].size() > configOption.size()) {
+				const std::wstring tempWide = wideArgs[i].substr(configOption.size());
+				const std::string tempStr = ConvertWStringToUTF8(tempWide);
+				std::strncpy(configFilename, tempStr.c_str(), MAX_PATH);
 			}
-			if (!strncmp(__argv[i], controlsOption, strlen(controlsOption)) && strlen(__argv[i]) > strlen(controlsOption)) {
-				controlsConfigFilename = __argv[i] + strlen(controlsOption);
+
+			if (wideArgs[i].find(controlsOption) != std::wstring::npos && wideArgs[i].size() > controlsOption.size()) {
+				const std::wstring tempWide = wideArgs[i].substr(controlsOption.size());
+				const std::string tempStr = ConvertWStringToUTF8(tempWide);
+				std::strncpy(controlsConfigFilename, tempStr.c_str(), MAX_PATH);
 			}
 		}
 	}
@@ -348,34 +427,55 @@ int WINAPI WinMain(HINSTANCE _hInstance, HINSTANCE hPrevInstance, LPSTR szCmdLin
 
 	bool debugLogLevel = false;
 
+	const std::wstring gpuBackend = L"--graphics=";
+
 	// The rest is handled in NativeInit().
-	for (int i = 1; i < __argc; ++i)
-	{
-		if (__argv[i][0] == '\0')
+	for (size_t i = 1; i < wideArgs.size(); ++i) {
+		if (wideArgs[i][0] == L'\0')
 			continue;
 
-		if (__argv[i][0] == '-')
-		{
-			switch (__argv[i][1])
-			{
-			case 'l':
+		if (wideArgs[i][0] == L'-') {
+			switch (wideArgs[i][1]) {
+			case L'l':
 				showLog = true;
 				g_Config.bEnableLogging = true;
 				break;
-			case 's':
+			case L's':
 				g_Config.bAutoRun = false;
 				g_Config.bSaveSettings = false;
 				break;
-			case 'd':
+			case L'd':
 				debugLogLevel = true;
 				break;
 			}
 
-			if (!strncmp(__argv[i], "--fullscreen", strlen("--fullscreen")))
+			if (wideArgs[i] == L"--fullscreen")
 				g_Config.bFullScreen = true;
 
-			if (!strncmp(__argv[i], "--windowed", strlen("--windowed")))
+			if (wideArgs[i] == L"--windowed")
 				g_Config.bFullScreen = false;
+
+			if (wideArgs[i].find(gpuBackend) != std::wstring::npos && wideArgs[i].size() > gpuBackend.size()) {
+				const std::wstring restOfOption = wideArgs[i].substr(gpuBackend.size());
+
+				// Force software rendering off, as picking directx9 or gles implies HW acceleration.
+				// Once software rendering supports Direct3D9/11, we can add more options for software,
+				// such as "software-gles", "software-d3d9", and "software-d3d11", or something similar.
+				// For now, software rendering force-activates OpenGL.
+				if (restOfOption == L"directx9") {
+					g_Config.iGPUBackend = GPU_BACKEND_DIRECT3D9;
+					g_Config.bSoftwareRendering = false;
+				}
+				else if (restOfOption == L"gles") {
+					g_Config.iGPUBackend = GPU_BACKEND_OPENGL;
+					g_Config.bSoftwareRendering = false;
+				}
+				
+				else if (restOfOption == L"software") {
+					g_Config.iGPUBackend = GPU_BACKEND_OPENGL;
+					g_Config.bSoftwareRendering = true;
+				}
+			}
 		}
 	}
 #ifdef _DEBUG
@@ -481,7 +581,23 @@ int WINAPI WinMain(HINSTANCE _hInstance, HINSTANCE hPrevInstance, LPSTR szCmdLin
 	DialogManager::DestroyAll();
 	timeEndPeriod(1);
 	delete host;
+
+	// Is there a safer place to do this?
+	// Doing this in Config::Save requires knowing if the UI state is UISTATE_EXIT,
+	// but that causes UnitTest to fail linking with 400 errors if System.h is included..
+	if (g_Config.iTempGPUBackend != g_Config.iGPUBackend) {
+		g_Config.iGPUBackend = g_Config.iTempGPUBackend;
+
+		// For now, turn off software rendering too, similar to the command-line.
+		g_Config.bSoftwareRendering = false;
+	}
+
 	g_Config.Save();
 	LogManager::Shutdown();
+
+	if (g_Config.bRestartRequired) {
+		W32Util::ExitAndRestart();
+	}
+	CoUninitialize();
 	return 0;
 }

@@ -11,7 +11,7 @@ fi
 
 # Check Symbian NDK
 if [ ! -z "$EPOCROOT" ]; then
-	QMAKE_ARGS="-spec symbian-sbsv2"
+	QMAKE_ARGS="-spec symbian-sbsv2 ${QMAKE_ARGS}"
 	CMAKE=0
 	PACKAGE=1
 	MAKE_OPT="release-gcce ${MAKE_OPT}"
@@ -37,21 +37,21 @@ do
 			CMAKE_ARGS="-DSIMULATOR=ON ${CMAKE_ARGS}"
 			;;
 		--release)
-			if [ "$CMAKE" == "1" ]; then
-				CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release ${CMAKE_ARGS}"
-			else
-				QMAKE_ARGS="CONFIG+=release ${QMAKE_ARGS}"
-			fi
+			CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release ${CMAKE_ARGS}"
+			QMAKE_ARGS="CONFIG+=release ${QMAKE_ARGS}"
 			;;
 		--debug)
-			if [ "$CMAKE" == "1" ]; then
-				CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Debug ${CMAKE_ARGS}"
-			else
-				QMAKE_ARGS="CONFIG+=debug ${QMAKE_ARGS}"
-			fi
+			CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Debug ${CMAKE_ARGS}"
+			QMAKE_ARGS="CONFIG+=debug ${QMAKE_ARGS}"
+			;;
+		--system-ffmpeg)
+			QMAKE_ARGS="CONFIG+=system_ffmpeg ${QMAKE_ARGS}"
 			;;
 		--headless) echo "Headless mode enabled"
 			CMAKE_ARGS="-DHEADLESS=ON ${CMAKE_ARGS}"
+			;;
+		--unittest) echo "Build unittest"
+			CMAKE_ARGS="-DUNITTEST=ON ${CMAKE_ARGS}"
 			;;
 		--no-package) echo "Packaging disabled"
 			PACKAGE=0
@@ -74,13 +74,17 @@ done
 if [ ! -z "$TARGET_OS" ]; then
 	echo "Building for $TARGET_OS"
 	BUILD_DIR="$(tr [A-Z] [a-z] <<< build-"$TARGET_OS")"
-# HACK (doesn't like shadowed dir)
+	# HACK (doesn't like shadowed dir)
 	if [ "$TARGET_OS" == "Symbian" ]; then
 		BUILD_DIR="Qt"
 	fi
 else
 	echo "Building for native host."
-	BUILD_DIR="build"
+	if [ "$CMAKE" == "0" ]; then
+		BUILD_DIR="build-qt"
+	else
+		BUILD_DIR="build"
+	fi
 fi
 
 # Strict errors. Any non-zero return exits this script

@@ -1,4 +1,4 @@
-VERSION = 0.9.9
+VERSION = 1.0.1.0
 DEFINES += USING_QT_UI USE_FFMPEG
 
 # Global specific
@@ -12,20 +12,20 @@ RCC_DIR = $$CONFIG_DIR/.rcc/$$TARGET
 QMAKE_CLEAN += -r $$OBJECTS_DIR $$MOC_DIR $$UI_DIR $$RCC_DIR
 
 P = $$_PRO_FILE_PWD_/..
-INCLUDEPATH += $$P/ext/zlib $$P/Common
+INCLUDEPATH += $$P/Common
+win32|contains(QT_CONFIG, no-zlib): INCLUDEPATH += $$P/ext/zlib
 
 # Work out arch name
 include(Platform/ArchDetection.pri)
 # Work out platform name
 include(Platform/OSDetection.pri)
 # OS dependent paths
-INCLUDEPATH += $$P/ffmpeg/$${PLATFORM_NAME}/$${PLATFORM_ARCH}/include
+!system_ffmpeg: INCLUDEPATH += $$P/ffmpeg/$${PLATFORM_NAME}/$${PLATFORM_ARCH}/include
 
 !contains(CONFIG, staticlib) {
-	QMAKE_LIBDIR += $$CONFIG_DIR $$P/ffmpeg/$${PLATFORM_NAME}/$${PLATFORM_ARCH}/lib/
-	g++: LIBS += -Wl,-Bstatic
+	QMAKE_LIBDIR += $$CONFIG_DIR
+	!system_ffmpeg: QMAKE_LIBDIR += $$P/ffmpeg/$${PLATFORM_NAME}/$${PLATFORM_ARCH}/lib/
 	contains(DEFINES, USE_FFMPEG): LIBS+=  -lavformat -lavcodec -lavutil -lswresample -lswscale
-	g++: LIBS += -Wl,-Bdynamic
 	equals(PLATFORM_NAME, "linux"):arm|android: LIBS += -lEGL
 }
 
@@ -59,10 +59,10 @@ contains(QT_CONFIG, opengles.) {
 	DEFINES += USING_GLES2
 	# How else do we know if the environment prefers windows?
 	!equals(PLATFORM_NAME, "linux")|android|maemo {
-		DEFINES += MOBILE_DEVICE
 		CONFIG += mobile_platform
 	}
 }
+mobile_platform: DEFINES += MOBILE_DEVICE
 
 # Handle flags for both C and C++
 QMAKE_CFLAGS += $$QMAKE_ALLFLAGS

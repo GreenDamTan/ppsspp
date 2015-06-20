@@ -23,12 +23,11 @@
 
 #include "Core/Core.h"
 #include "Core/Config.h"
-#include "Core/MIPS/JitCommon/JitCommon.h"
+#include "Core/MIPS/JitCommon/NativeJit.h"
 
 #include "UI/OnScreenDisplay.h"
 #include "UI/ui_atlas.h"
 #include "UI/GamepadEmu.h"
-#include "UI/UIShader.h"
 
 #include "UI/MainScreen.h"
 #include "UI/EmuScreen.h"
@@ -73,10 +72,11 @@ void CwCheatScreen::CreateViews() {
 	leftColumn->Add(new Choice(d->T("Back")))->OnClick.Handle<UIScreen>(this, &UIScreen::OnBack);
 	//leftColumn->Add(new Choice(k->T("Add Cheat")))->OnClick.Handle(this, &CwCheatScreen::OnAddCheat);
 	leftColumn->Add(new Choice(k->T("Import Cheats")))->OnClick.Handle(this, &CwCheatScreen::OnImportCheat);
-#if defined(_WIN32) || defined(__APPLE__) || defined(__linux__)
+#if !defined(MOBILE_DEVICE)
 	leftColumn->Add(new Choice(k->T("Edit Cheat File")))->OnClick.Handle(this, &CwCheatScreen::OnEditCheatFile);
 #endif
 	leftColumn->Add(new Choice(k->T("Enable/Disable All")))->OnClick.Handle(this, &CwCheatScreen::OnEnableAll);
+	leftColumn->Add(new PopupSliderChoice(&g_Config.iCwCheatRefreshRate, 1, 1000, k->T("Refresh Rate"), 1, screenManager()));
 
 	ScrollView *rightScroll = new ScrollView(ORIENT_VERTICAL, new LinearLayoutParams(0.5f));
 	rightScroll->SetScrollToTop(false);
@@ -113,7 +113,6 @@ void CwCheatScreen::onFinish(DialogResult result) {
 
 UI::EventReturn CwCheatScreen::OnEnableAll(UI::EventParams &params) {
 	std::fstream fs;
-	std::vector<std::string> temp = cheatList;
 	enableAll = !enableAll;
 	File::OpenCPPFile(fs, activeCheatFile, std::ios::out);
 	for (int j = 0; j < (int)cheatList.size(); j++) {
@@ -146,23 +145,29 @@ UI::EventReturn CwCheatScreen::OnAddCheat(UI::EventParams &params) {
 
 UI::EventReturn CwCheatScreen::OnEditCheatFile(UI::EventParams &params) {
 	std::string cheatFile;
+	g_Config.bReloadCheats = true;
+	if (MIPSComp::jit) {
+		MIPSComp::jit->ClearCache();
+	}
+	screenManager()->finishDialog(this, DR_OK);
 #ifdef _WIN32
 	cheatFile = activeCheatFile;
 	// Can't rely on a .txt file extension to auto-open in the right editor,
 	// so let's find notepad
-	wchar_t notepad_path[MAX_PATH];
-	GetSystemDirectory(notepad_path, sizeof(notepad_path) / sizeof(wchar_t));
+	wchar_t notepad_path[MAX_PATH + 1];
+	GetSystemDirectory(notepad_path, MAX_PATH);
 	wcscat(notepad_path, L"\\notepad.exe");
 
-	wchar_t cheat_path[MAX_PATH];
-	wcscpy(cheat_path, ConvertUTF8ToWString(cheatFile).c_str());
+	wchar_t cheat_path[MAX_PATH + 1] = {0};
+	wcsncpy(cheat_path, ConvertUTF8ToWString(cheatFile).c_str(), MAX_PATH);
 	// Flip any slashes...
 	for (size_t i = 0; i < wcslen(cheat_path); i++) {
 		if (cheat_path[i] == '/')
 			cheat_path[i] = '\\';
 	}
 
-	wchar_t command_line[MAX_PATH * 2 + 1];
+	// One for the space, one for the null.
+	wchar_t command_line[MAX_PATH * 2 + 1 + 1];
 	wsprintf(command_line, L"%s %s", notepad_path, cheat_path);
 
 	STARTUPINFO si;
@@ -173,17 +178,20 @@ UI::EventReturn CwCheatScreen::OnEditCheatFile(UI::EventParams &params) {
 	memset(&pi, 0, sizeof(pi));
 	UINT retval = CreateProcess(0, command_line, 0, 0, 0, 0, 0, 0, &si, &pi);
 	if (!retval) {
-		ERROR_LOG(BOOT, "Failed creating notepad process");
+		ERROR_LOG(COMMON, "Failed creating notepad process");
 	}
-#elif defined(__APPLE__) || defined(__linux__)
-#if defined(__linux__)
-	cheatFile = "xdg-open ";
-#elif defined(__APPLE__)
+#elif !defined(MOBILE_DEVICE)
+#if defined(__APPLE__)
 	cheatFile = "open ";
+#else
+	cheatFile = "xdg-open ";
 #endif
 	cheatFile.append(activeCheatFile);
 	NOTICE_LOG(BOOT, "Launching %s", cheatFile.c_str());
-	system(cheatFile.c_str());
+	int retval = system(cheatFile.c_str());
+	if (retval != 0) {
+		ERROR_LOG(COMMON, "Failed to launch cheat file");
+	}
 #endif
 	return UI::EVENT_DONE;
 }
@@ -252,7 +260,7 @@ UI::EventReturn CwCheatScreen::OnImportCheat(UI::EventParams &params) {
 		fs << title[0] << "\n" << title[1];
 	}
 
-	NOTICE_LOG(COMMON, "Imported %lu entries from %s.\n", newList.size(), cheatFile.c_str());
+	NOTICE_LOG(COMMON, "Imported %u entries from %s.\n", (int)newList.size(), cheatFile.c_str());
 	if (newList.size() != 0) {
 		fs << "\n";
 	}
@@ -319,7 +327,7 @@ void CheatCheckBox::Draw(UIContext &dc) {
 
 	int image = *toggle_ ? dc.theme->checkOn : dc.theme->checkOff;
 
-	Style style = dc.theme->itemStyle;
+	UI::Style style = dc.theme->itemStyle;
 	if (!IsEnabled())
 		style = dc.theme->itemDisabledStyle;
 

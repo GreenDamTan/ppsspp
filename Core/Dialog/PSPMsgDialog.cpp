@@ -15,12 +15,12 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
-#include "PSPMsgDialog.h"
-#include "../Util/PPGeDraw.h"
-#include "../HLE/sceCtrl.h"
-#include "../Core/MemMap.h"
+#include "Core/Dialog/PSPMsgDialog.h"
+#include "Core/Util/PPGeDraw.h"
+#include "Core/HLE/sceCtrl.h"
+#include "Core/MemMapHelpers.h"
 #include "Core/Reporting.h"
-#include "ChunkFile.h"
+#include "Common/ChunkFile.h"
 #include "i18n/i18n.h"
 #include "util/text/utf8.h"
 
@@ -218,7 +218,7 @@ int PSPMsgDialog::Update(int animSpeed) {
 		return SCE_ERROR_UTILITY_INVALID_STATUS;
 	}
 
-	if ((flag & DS_ERROR)) {
+	if (flag & (DS_ERROR | DS_ABORT)) {
 		ChangeStatus(SCE_UTILITY_STATUS_FINISHED, 0);
 	} else {
 		UpdateButtons();
@@ -290,7 +290,8 @@ int PSPMsgDialog::Abort() {
 	if (GetStatus() != SCE_UTILITY_STATUS_RUNNING) {
 		return SCE_ERROR_UTILITY_INVALID_STATUS;
 	} else {
-		ChangeStatus(SCE_UTILITY_STATUS_FINISHED, 0);
+		// Status is not actually changed until Update().
+		flag |= DS_ABORT;
 		return 0;
 	}
 }

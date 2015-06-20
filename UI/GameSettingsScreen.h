@@ -24,7 +24,7 @@
 // per game.
 class GameSettingsScreen : public UIDialogScreenWithGameBackground {
 public:
-	GameSettingsScreen(std::string gamePath, std::string gameID = "");
+	GameSettingsScreen(std::string gamePath, std::string gameID = "", bool editThenRestore = false);
 
 	virtual void update(InputState &input);
 	virtual void onFinish(DialogResult result);
@@ -35,11 +35,13 @@ protected:
 	virtual void CreateViews();
 	virtual void sendMessage(const char *message, const char *value);
 	void CallbackRestoreDefaults(bool yes);
-
+	void CallbackRenderingBackend(bool yes);
 	bool UseVerticalLayout() const;
 
 private:
 	std::string gameID_;
+	//edit the game-specific settings and restore the global settings after exiting
+	bool bEditThenRestore;
 	bool lastVertical_;
 	// As we load metadata in the background, we need to be able to update these after the fact.
 	UI::TextView *tvTitle_;
@@ -49,6 +51,13 @@ private:
 	UI::Choice *postProcChoice_;
 	UI::PopupMultiChoice *resolutionChoice_;
 	UI::CheckBox *frameSkipAuto_;
+#ifdef _WIN32
+	UI::CheckBox *SavePathInMyDocumentChoice;
+	UI::CheckBox *SavePathInOtherChoice;
+	// Used to enable/disable the above two options.
+	bool installed_;
+	bool otherinstalled_;
+#endif
 
 	// Event handlers
 	UI::EventReturn OnControlMapping(UI::EventParams &e);
@@ -56,7 +65,7 @@ private:
 	UI::EventReturn OnDumpNextFrameToLog(UI::EventParams &e);
 	UI::EventReturn OnReloadCheats(UI::EventParams &e);
 	UI::EventReturn OnTiltTypeChange(UI::EventParams &e);
-	UI::EventReturn OnTiltCuztomize(UI::EventParams &e);
+	UI::EventReturn OnTiltCustomize(UI::EventParams &e);
 
 	// Global settings handlers
 	UI::EventReturn OnLanguage(UI::EventParams &e);
@@ -75,12 +84,22 @@ private:
 	UI::EventReturn OnShaderChange(UI::EventParams &e);
 	UI::EventReturn OnRestoreDefaultSettings(UI::EventParams &e);
 	UI::EventReturn OnRenderingMode(UI::EventParams &e);
+	UI::EventReturn OnRenderingBackend(UI::EventParams &e);
 	UI::EventReturn OnJitAffectingSetting(UI::EventParams &e);
+#ifdef _WIN32
+	UI::EventReturn OnSavePathMydoc(UI::EventParams &e);
+	UI::EventReturn OnSavePathOther(UI::EventParams &e);
+#endif
 	UI::EventReturn OnSoftwareRendering(UI::EventParams &e);
 	UI::EventReturn OnHardwareTransform(UI::EventParams &e);
 
 	UI::EventReturn OnScreenRotation(UI::EventParams &e);
 	UI::EventReturn OnImmersiveModeChange(UI::EventParams &e);
+
+	UI::EventReturn OnAdhocGuides(UI::EventParams &e);
+	UI::EventReturn OnAudioBackend(UI::EventParams &e);
+
+	UI::EventReturn OnSavedataManager(UI::EventParams &e);
 
 	// Temporaries to convert bools to int settings
 	bool cap60FPS_;
@@ -91,6 +110,8 @@ private:
 	bool vtxCacheEnable_;
 	bool postProcEnable_;
 	bool resolutionEnable_;
+	bool bloomHackEnable_;
+	bool displayRotEnable_;
 };
 
 class DeveloperToolsScreen : public UIDialogScreenWithBackground {

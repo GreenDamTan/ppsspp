@@ -37,6 +37,7 @@ private:
 	UI::EventReturn OnDefaultMapping(UI::EventParams &params);
 	UI::EventReturn OnClearMapping(UI::EventParams &params);
 	UI::EventReturn OnAutoConfigure(UI::EventParams &params);
+	UI::EventReturn OnTestAnalogs(UI::EventParams &params);
 
 	virtual void dialogFinished(const Screen *dialog, DialogResult result) override;
 
@@ -66,4 +67,16 @@ private:
 	bool replace_;
 	std::function<void(KeyDef)> callback_;
 	bool mapped_;  // Prevent double registrations
+};
+
+class AnalogTestScreen : public UIDialogScreenWithBackground {
+public:
+	AnalogTestScreen() {}
+
+	bool key(const KeyInput &key) override;
+
+protected:
+	virtual void CreateViews() override;
+
+	UI::TextView *lastKeyEvent_;
 };

@@ -67,6 +67,9 @@
     <ClCompile Include="DSoundStream.cpp">
       <Filter>Windows\System</Filter>
     </ClCompile>
+    <ClCompile Include="D3D9Base.cpp">
+      <Filter>Windows\System</Filter>
+    </ClCompile>
     <ClCompile Include="OpenGLBase.cpp">
       <Filter>Windows\System</Filter>
     </ClCompile>
@@ -95,13 +98,13 @@
     <ClCompile Include="..\android\jni\ArmEmitterTest.cpp">
       <Filter>Other Platforms</Filter>
     </ClCompile>
+    <ClCompile Include="..\android\jni\Arm64EmitterTest.cpp">
+      <Filter>Other Platforms</Filter>
+    </ClCompile>
     <ClCompile Include="..\android\jni\TestRunner.cpp">
       <Filter>Other Platforms</Filter>
     </ClCompile>
     <ClCompile Include="DinputDevice.cpp">
-      <Filter>Windows\Input</Filter>
-    </ClCompile>
-    <ClCompile Include="ControlMapping.cpp">
       <Filter>Windows\Input</Filter>
     </ClCompile>
     <ClCompile Include="Debugger\DebuggerShared.cpp">
@@ -187,6 +190,9 @@
     <ClInclude Include="DSoundStream.h">
       <Filter>Windows\System</Filter>
     </ClInclude>
+    <ClInclude Include="D3D9Base.h">
+      <Filter>Windows\System</Filter>
+    </ClInclude>
     <ClInclude Include="OpenGLBase.h">
       <Filter>Windows\System</Filter>
     </ClInclude>
@@ -212,16 +218,16 @@
       <Filter>Windows\Input</Filter>
     </ClInclude>
     <ClInclude Include="stdafx.h" />
-    <ClInclude Include="..\android\jni\ARMEmitterTest.h">
+    <ClInclude Include="..\android\jni\ArmEmitterTest.h">
+      <Filter>Other Platforms</Filter>
+    </ClInclude>
+    <ClInclude Include="..\android\jni\Arm64EmitterTest.h">
       <Filter>Other Platforms</Filter>
     </ClInclude>
     <ClInclude Include="..\android\jni\TestRunner.h">
       <Filter>Other Platforms</Filter>
     </ClInclude>
     <ClInclude Include="DinputDevice.h">
-      <Filter>Windows\Input</Filter>
-    </ClInclude>
-    <ClInclude Include="ControlMapping.h">
       <Filter>Windows\Input</Filter>
     </ClInclude>
     <ClInclude Include="Debugger\DebuggerShared.h">
@@ -271,9 +277,6 @@
     <None Include="icon1.ico">
       <Filter>Resource Files</Filter>
     </None>
-    <None Include="rt_manif.bin">
-      <Filter>Resource Files</Filter>
-    </None>
     <None Include="stop1.ico">
       <Filter>Resource Files</Filter>
     </None>
@@ -318,6 +321,9 @@
       <Filter>Other Platforms</Filter>
     </None>
     <None Include="..\assets\knownfuncs.ini">
+      <Filter>Resource Files</Filter>
+    </None>
+    <None Include="PPSSPP.manifest">
       <Filter>Resource Files</Filter>
     </None>
   </ItemGroup>

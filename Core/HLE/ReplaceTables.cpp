@@ -20,8 +20,10 @@
 
 #include "base/basictypes.h"
 #include "base/logging.h"
+#include "Common/Log.h"
 #include "Core/Config.h"
 #include "Core/Debugger/Breakpoints.h"
+#include "Core/Debugger/SymbolMap.h"
 #include "Core/MemMap.h"
 #include "Core/MIPS/JitCommon/JitCommon.h"
 #include "Core/MIPS/MIPSCodeUtils.h"
@@ -107,17 +109,23 @@ static int Replace_memcpy() {
 	u32 srcPtr = PARAM(1);
 	u32 bytes = PARAM(2);
 	bool skip = false;
+	if (!bytes) {
+		RETURN(destPtr);
+		return 10;
+	}
 
 	// Some games use memcpy on executable code.  We need to flush emuhack ops.
 	currentMIPS->InvalidateICache(srcPtr, bytes);
 	if (Memory::IsVRAMAddress(destPtr) || Memory::IsVRAMAddress(srcPtr)) {
 		skip = gpu->PerformMemoryCopy(destPtr, srcPtr, bytes);
 	}
-	if (!skip && bytes != 0 && destPtr != 0) {
-		u8 *dst = Memory::GetPointerUnchecked(destPtr);
-		const u8 *src = Memory::GetPointerUnchecked(srcPtr);
+	if (!skip && bytes != 0) {
+		u8 *dst = Memory::GetPointer(destPtr);
+		const u8 *src = Memory::GetPointer(srcPtr);
 
-		if (std::min(destPtr, srcPtr) + bytes > std::max(destPtr, srcPtr)) {
+		if (!dst || !src) {
+			// Already logged.
+		} else if (std::min(destPtr, srcPtr) + bytes > std::max(destPtr, srcPtr)) {
 			// Overlap.  Star Ocean breaks if it's not handled in 16 bytes blocks.
 			const u32 blocks = bytes & ~0x0f;
 			for (u32 offset = 0; offset < blocks; offset += 0x10) {
@@ -138,6 +146,46 @@ static int Replace_memcpy() {
 	return 10 + bytes / 4;  // approximation
 }
 
+static int Replace_memcpy_jak() {
+	u32 destPtr = PARAM(0);
+	u32 srcPtr = PARAM(1);
+	u32 bytes = PARAM(2);
+	bool skip = false;
+	if (bytes == 0) {
+		RETURN(destPtr);
+		return 5;
+	}
+	currentMIPS->InvalidateICache(srcPtr, bytes);
+	if (Memory::IsVRAMAddress(destPtr) || Memory::IsVRAMAddress(srcPtr)) {
+		skip = gpu->PerformMemoryCopy(destPtr, srcPtr, bytes);
+	}
+	if (!skip && bytes != 0) {
+		u8 *dst = Memory::GetPointer(destPtr);
+		const u8 *src = Memory::GetPointer(srcPtr);
+
+		if (!dst || !src) {
+		} else {
+			// Jak style overlap.
+			for (u32 i = 0; i < bytes; i++) {
+				dst[i] = src[i];
+			}
+		}
+	}
+
+	// Jak relies on more registers coming out right than the ABI specifies.
+	// See the disassembly of the function for the explanations for these...
+	currentMIPS->r[MIPS_REG_T0] = 0;
+	currentMIPS->r[MIPS_REG_A0] = -1;
+	currentMIPS->r[MIPS_REG_A2] = 0;
+	currentMIPS->r[MIPS_REG_A3] = destPtr + bytes;
+	RETURN(destPtr);
+#ifndef MOBILE_DEVICE
+	CBreakPoints::ExecMemCheck(srcPtr, false, bytes, currentMIPS->pc);
+	CBreakPoints::ExecMemCheck(destPtr, true, bytes, currentMIPS->pc);
+#endif
+	return 5 + bytes * 8 + 2;  // approximation. This is a slow memcpy - a byte copy loop..
+}
+
 static int Replace_memcpy16() {
 	u32 destPtr = PARAM(0);
 	u32 srcPtr = PARAM(1);
@@ -150,9 +198,11 @@ static int Replace_memcpy16() {
 		skip = gpu->PerformMemoryCopy(destPtr, srcPtr, bytes);
 	}
 	if (!skip && bytes != 0) {
-		u8 *dst = Memory::GetPointerUnchecked(destPtr);
-		u8 *src = Memory::GetPointerUnchecked(srcPtr);
-		memmove(dst, src, bytes);
+		u8 *dst = Memory::GetPointer(destPtr);
+		const u8 *src = Memory::GetPointer(srcPtr);
+		if (dst && src) {
+			memmove(dst, src, bytes);
+		}
 	}
 	RETURN(destPtr);
 #ifndef MOBILE_DEVICE
@@ -170,22 +220,24 @@ static int Replace_memcpy_swizzled() {
 	if (Memory::IsVRAMAddress(srcPtr)) {
 		gpu->PerformMemoryDownload(srcPtr, pitch * h);
 	}
-	u8 *dstp = Memory::GetPointerUnchecked(destPtr);
-	const u8 *srcp = Memory::GetPointerUnchecked(srcPtr);
+	u8 *dstp = Memory::GetPointer(destPtr);
+	const u8 *srcp = Memory::GetPointer(srcPtr);
 
-	const u8 *ysrcp = srcp;
-	for (u32 y = 0; y < h; y += 8) {
-		const u8 *xsrcp = ysrcp;
-		for (u32 x = 0; x < pitch; x += 16) {
-			const u8 *src = xsrcp;
-			for (int n = 0; n < 8; ++n) {
-				memcpy(dstp, src, 16);
-				src += pitch;
-				dstp += 16;
+	if (dstp && srcp) {
+		const u8 *ysrcp = srcp;
+		for (u32 y = 0; y < h; y += 8) {
+			const u8 *xsrcp = ysrcp;
+			for (u32 x = 0; x < pitch; x += 16) {
+				const u8 *src = xsrcp;
+				for (int n = 0; n < 8; ++n) {
+					memcpy(dstp, src, 16);
+					src += pitch;
+					dstp += 16;
+				}
+				xsrcp += 16;
 			}
-			xsrcp += 16;
+			ysrcp += 8 * pitch;
 		}
-		ysrcp += 8 * pitch;
 	}
 
 	RETURN(0);
@@ -208,9 +260,11 @@ static int Replace_memmove() {
 		skip = gpu->PerformMemoryCopy(destPtr, srcPtr, bytes);
 	}
 	if (!skip && bytes != 0) {
-		u8 *dst = Memory::GetPointerUnchecked(destPtr);
-		u8 *src = Memory::GetPointerUnchecked(srcPtr);
-		memmove(dst, src, bytes);
+		u8 *dst = Memory::GetPointer(destPtr);
+		const u8 *src = Memory::GetPointer(srcPtr);
+		if (dst && src) {
+			memmove(dst, src, bytes);
+		}
 	}
 	RETURN(destPtr);
 #ifndef MOBILE_DEVICE
@@ -222,15 +276,17 @@ static int Replace_memmove() {
 
 static int Replace_memset() {
 	u32 destPtr = PARAM(0);
-	u8 *dst = Memory::GetPointerUnchecked(destPtr);
 	u8 value = PARAM(1);
 	u32 bytes = PARAM(2);
 	bool skip = false;
 	if (Memory::IsVRAMAddress(destPtr)) {
 		skip = gpu->PerformMemorySet(destPtr, value, bytes);
 	}
-	if (!skip) {
-		memset(dst, value, bytes);
+	if (!skip && bytes != 0) {
+		u8 *dst = Memory::GetPointer(destPtr);
+		if (dst) {
+			memset(dst, value, bytes);
+		}
 	}
 	RETURN(destPtr);
 #ifndef MOBILE_DEVICE
@@ -239,45 +295,89 @@ static int Replace_memset() {
 	return 10 + bytes / 4;  // approximation
 }
 
+static int Replace_memset_jak() {
+	u32 destPtr = PARAM(0);
+	u8 value = PARAM(1);
+	u32 bytes = PARAM(2);
+
+	if (bytes == 0) {
+		RETURN(destPtr);
+		return 5;
+	}
+
+	bool skip = false;
+	if (Memory::IsVRAMAddress(destPtr)) {
+		skip = gpu->PerformMemorySet(destPtr, value, bytes);
+	}
+	if (!skip && bytes != 0) {
+		u8 *dst = Memory::GetPointer(destPtr);
+		if (dst) {
+			memset(dst, value, bytes);
+		}
+	}
+
+	currentMIPS->r[MIPS_REG_T0] = destPtr + bytes;
+	currentMIPS->r[MIPS_REG_A2] = -1;
+	currentMIPS->r[MIPS_REG_A3] = -1;
+	RETURN(destPtr);
+
+#ifndef MOBILE_DEVICE
+	CBreakPoints::ExecMemCheck(destPtr, true, bytes, currentMIPS->pc);
+#endif
+	return 5 + bytes * 6 + 2;  // approximation (hm, inspecting the disasm this should be 5 + 6 * bytes + 2, but this is what works..)
+}
+
 static int Replace_strlen() {
 	u32 srcPtr = PARAM(0);
-	const char *src = (const char *)Memory::GetPointerUnchecked(srcPtr);
-	u32 len = (u32)strlen(src);
+	const char *src = (const char *)Memory::GetPointer(srcPtr);
+	u32 len = src ? (u32)strlen(src) : 0UL;
 	RETURN(len);
 	return 7 + len * 4;  // approximation
 }
 
 static int Replace_strcpy() {
 	u32 destPtr = PARAM(0);
-	char *dst = (char *)Memory::GetPointerUnchecked(destPtr);
-	const char *src = (const char *)Memory::GetPointerUnchecked(PARAM(1));
-	strcpy(dst, src);
+	char *dst = (char *)Memory::GetPointer(destPtr);
+	const char *src = (const char *)Memory::GetPointer(PARAM(1));
+	if (dst && src) {
+		strcpy(dst, src);
+	}
 	RETURN(destPtr);
 	return 10;  // approximation
 }
 
 static int Replace_strncpy() {
 	u32 destPtr = PARAM(0);
-	char *dst = (char *)Memory::GetPointerUnchecked(destPtr);
-	const char *src = (const char *)Memory::GetPointerUnchecked(PARAM(1));
+	char *dst = (char *)Memory::GetPointer(destPtr);
+	const char *src = (const char *)Memory::GetPointer(PARAM(1));
 	u32 bytes = PARAM(2);
-	strncpy(dst, src, bytes);
+	if (dst && src && bytes != 0) {
+		strncpy(dst, src, bytes);
+	}
 	RETURN(destPtr);
 	return 10;  // approximation
 }
 
 static int Replace_strcmp() {
-	const char *a = (const char *)Memory::GetPointerUnchecked(PARAM(0));
-	const char *b = (const char *)Memory::GetPointerUnchecked(PARAM(1));
-	RETURN(strcmp(a, b));
+	const char *a = (const char *)Memory::GetPointer(PARAM(0));
+	const char *b = (const char *)Memory::GetPointer(PARAM(1));
+	if (a && b) {
+		RETURN(strcmp(a, b));
+	} else {
+		RETURN(0);
+	}
 	return 10;  // approximation
 }
 
 static int Replace_strncmp() {
-	const char *a = (const char *)Memory::GetPointerUnchecked(PARAM(0));
-	const char *b = (const char *)Memory::GetPointerUnchecked(PARAM(1));
+	const char *a = (const char *)Memory::GetPointer(PARAM(0));
+	const char *b = (const char *)Memory::GetPointer(PARAM(1));
 	u32 bytes = PARAM(2);
-	RETURN(strncmp(a, b, bytes));
+	if (a && b && bytes != 0) {
+		RETURN(strncmp(a, b, bytes));
+	} else {
+		RETURN(0);
+	}
 	return 10 + bytes / 4;  // approximation
 }
 
@@ -287,12 +387,14 @@ static int Replace_fabsf() {
 }
 
 static int Replace_vmmul_q_transp() {
-	float *out = (float *)Memory::GetPointerUnchecked(PARAM(0));
-	const float *a = (const float *)Memory::GetPointerUnchecked(PARAM(1));
-	const float *b = (const float *)Memory::GetPointerUnchecked(PARAM(2));
+	float *out = (float *)Memory::GetPointer(PARAM(0));
+	const float *a = (const float *)Memory::GetPointer(PARAM(1));
+	const float *b = (const float *)Memory::GetPointer(PARAM(2));
 
 	// TODO: Actually use an optimized matrix multiply here...
-	Matrix4ByMatrix4(out, b, a);
+	if (out && b && a) {
+		Matrix4ByMatrix4(out, b, a);
+	}
 	return 16;
 }
 
@@ -300,10 +402,20 @@ static int Replace_vmmul_q_transp() {
 // a1 = matrix
 // a2 = source address
 static int Replace_gta_dl_write_matrix() {
-	u32 *ptr = (u32 *)Memory::GetPointerUnchecked(PARAM(0));
-	u32 *dest = (u32_le *)Memory::GetPointerUnchecked(ptr[0]);
-	u32 *src = (u32_le *)Memory::GetPointerUnchecked(PARAM(2));
+	u32 *ptr = (u32 *)Memory::GetPointer(PARAM(0));
+	u32 *src = (u32_le *)Memory::GetPointer(PARAM(2));
 	u32 matrix = PARAM(1) << 24;
+
+	if (!ptr || !src) {
+		RETURN(0);
+		return 38;
+	}
+
+	u32 *dest = (u32_le *)Memory::GetPointer(ptr[0]);
+	if (!dest) {
+		RETURN(0);
+		return 38;
+	}
 
 #if defined(_M_IX86) || defined(_M_X64)
 	__m128i topBytes = _mm_set1_epi32(matrix);
@@ -340,6 +452,7 @@ static int Replace_gta_dl_write_matrix() {
 #endif
 
 	(*ptr) += 0x30;
+
 	RETURN(0);
 	return 38;
 }
@@ -348,9 +461,19 @@ static int Replace_gta_dl_write_matrix() {
 // TODO: Inline into a few NEON or SSE instructions - especially if a1 is a known immediate!
 // Anyway, not sure if worth it. There's not that many matrices written per frame normally.
 static int Replace_dl_write_matrix() {
-	u32 *dlStruct = (u32 *)Memory::GetPointerUnchecked(PARAM(0));
-	u32 *dest = (u32 *)Memory::GetPointerUnchecked(dlStruct[2]);
-	u32 *src = (u32 *)Memory::GetPointerUnchecked(PARAM(2));
+	u32 *dlStruct = (u32 *)Memory::GetPointer(PARAM(0));
+	u32 *src = (u32 *)Memory::GetPointer(PARAM(2));
+
+	if (!dlStruct || !src) {
+		RETURN(0);
+		return 60;
+	}
+
+	u32 *dest = (u32 *)Memory::GetPointer(dlStruct[2]);
+	if (!dest) {
+		RETURN(0);
+		return 60;
+	}
 
 	u32 matrix;
 	int count = 12;
@@ -506,7 +629,7 @@ static int Hook_hexyzforce_monoclome_thread() {
 }
 
 static int Hook_starocean_write_stencil() {
-	u32 fb_address = currentMIPS->r[MIPS_REG_T7];
+	const u32 fb_address = currentMIPS->r[MIPS_REG_T7];
 	if (Memory::IsVRAMAddress(fb_address) && !g_Config.bDisableStencilTest) {
 		gpu->PerformStencilUpload(fb_address, 0x00088000);
 	}
@@ -514,7 +637,7 @@ static int Hook_starocean_write_stencil() {
 }
 
 static int Hook_topx_create_saveicon() {
-	u32 fb_address = currentMIPS->r[MIPS_REG_V0];
+	const u32 fb_address = currentMIPS->r[MIPS_REG_V0];
 	if (Memory::IsVRAMAddress(fb_address)) {
 		gpu->PerformMemoryDownload(fb_address, 0x00044000);
 		CBreakPoints::ExecMemCheck(fb_address, true, 0x00044000, currentMIPS->pc);
@@ -523,7 +646,7 @@ static int Hook_topx_create_saveicon() {
 }
 
 static int Hook_ff1_battle_effect() {
-	u32 fb_address = currentMIPS->r[MIPS_REG_A1];
+	const u32 fb_address = currentMIPS->r[MIPS_REG_A1];
 	if (Memory::IsVRAMAddress(fb_address)) {
 		gpu->PerformMemoryDownload(fb_address, 0x00088000);
 		CBreakPoints::ExecMemCheck(fb_address, true, 0x00088000, currentMIPS->pc);
@@ -533,13 +656,384 @@ static int Hook_ff1_battle_effect() {
 
 static int Hook_dissidia_recordframe_avi() {
 	// This is called once per frame, and records that frame's data to avi.
-	u32 fb_address = currentMIPS->r[MIPS_REG_A1];
+	const u32 fb_address = currentMIPS->r[MIPS_REG_A1];
 	if (Memory::IsVRAMAddress(fb_address)) {
 		gpu->PerformMemoryDownload(fb_address, 0x00044000);
 		CBreakPoints::ExecMemCheck(fb_address, true, 0x00044000, currentMIPS->pc);
 	}
 	return 0;
 }
+
+static int Hook_brandish_download_frame() {
+	u32 fb_infoaddr;
+	if (!GetMIPSStaticAddress(fb_infoaddr, 0x2c, 0x30)) {
+		return 0;
+	}
+	const u32 fb_info = Memory::Read_U32(fb_infoaddr);
+	const MIPSOpcode fb_index_load = Memory::Read_Instruction(currentMIPS->pc + 0x38, true);
+	if (fb_index_load != MIPS_MAKE_LW(MIPS_GET_RT(fb_index_load), MIPS_GET_RS(fb_index_load), fb_index_load & 0xffff)) {
+		return 0;
+	}
+	const int fb_index_offset = (s16)(fb_index_load & 0xffff);
+	const u32 fb_index = (Memory::Read_U32(fb_info + fb_index_offset) + 1) & 1;
+	const u32 fb_address = 0x4000000 + (0x44000 * fb_index);
+	const u32 dest_address = currentMIPS->r[MIPS_REG_A1];
+	if (Memory::IsRAMAddress(dest_address)) {
+		gpu->PerformMemoryDownload(fb_address, 0x00044000);
+		CBreakPoints::ExecMemCheck(fb_address, true, 0x00044000, currentMIPS->pc);
+	}
+	return 0;
+}
+
+static int Hook_growlanser_create_saveicon() {
+    const u32 fb_address = Memory::Read_U32(currentMIPS->r[MIPS_REG_SP] + 4);
+    const u32 fmt = Memory::Read_U32(currentMIPS->r[MIPS_REG_SP]);
+    const u32 sz = fmt == GE_FORMAT_8888 ? 0x00088000 : 0x00044000;
+    if (Memory::IsVRAMAddress(fb_address) && fmt <= 3) {
+        gpu->PerformMemoryDownload(fb_address, sz);
+        CBreakPoints::ExecMemCheck(fb_address, true, sz, currentMIPS->pc);
+    }
+    return 0;
+}
+
+static int Hook_sd_gundam_g_generation_download_frame() {
+	const u32 fb_address = Memory::Read_U32(currentMIPS->r[MIPS_REG_SP] + 8);
+	const u32 fmt = Memory::Read_U32(currentMIPS->r[MIPS_REG_SP] + 4);
+	const u32 sz = fmt == GE_FORMAT_8888 ? 0x00088000 : 0x00044000;
+	if (Memory::IsVRAMAddress(fb_address) && fmt <= 3) {
+		gpu->PerformMemoryDownload(fb_address, sz);
+		CBreakPoints::ExecMemCheck(fb_address, true, sz, currentMIPS->pc);
+	}
+	return 0;
+}
+
+static int Hook_narisokonai_download_frame() {
+	const u32 fb_address = currentMIPS->r[MIPS_REG_V0];
+	if (Memory::IsVRAMAddress(fb_address)) {
+		gpu->PerformMemoryDownload(fb_address, 0x00044000);
+		CBreakPoints::ExecMemCheck(fb_address, true, 0x00044000, currentMIPS->pc);
+	}
+	return 0;
+}
+
+static int Hook_kirameki_school_life_download_frame() {
+	const u32 fb_address = currentMIPS->r[MIPS_REG_A2];
+	if (Memory::IsVRAMAddress(fb_address)) {
+		gpu->PerformMemoryDownload(fb_address, 0x00088000);
+		CBreakPoints::ExecMemCheck(fb_address, true, 0x00088000, currentMIPS->pc);
+	}
+	return 0;
+}
+
+static int Hook_orenoimouto_download_frame() {
+	const u32 fb_address = currentMIPS->r[MIPS_REG_A4];
+	if (Memory::IsVRAMAddress(fb_address)) {
+		gpu->PerformMemoryDownload(fb_address, 0x00088000);
+		CBreakPoints::ExecMemCheck(fb_address, true, 0x00088000, currentMIPS->pc);
+	}
+	return 0;
+}
+
+static int Hook_sakurasou_download_frame() {
+	const u32 fb_address = currentMIPS->r[MIPS_REG_V0];
+	if (Memory::IsVRAMAddress(fb_address)) {
+		gpu->PerformMemoryDownload(fb_address, 0x00088000);
+		CBreakPoints::ExecMemCheck(fb_address, true, 0x00088000, currentMIPS->pc);
+	}
+	return 0;
+}
+
+static int Hook_suikoden1_and_2_download_frame_1() {
+	const u32 fb_address = currentMIPS->r[MIPS_REG_S4];
+	if (Memory::IsVRAMAddress(fb_address)) {
+		gpu->PerformMemoryDownload(fb_address, 0x00088000);
+		CBreakPoints::ExecMemCheck(fb_address, true, 0x00088000, currentMIPS->pc);
+	}
+	return 0;
+}
+
+static int Hook_suikoden1_and_2_download_frame_2() {
+	const u32 fb_address = currentMIPS->r[MIPS_REG_S2];
+	if (Memory::IsVRAMAddress(fb_address)) {
+		gpu->PerformMemoryDownload(fb_address, 0x00088000);
+		CBreakPoints::ExecMemCheck(fb_address, true, 0x00088000, currentMIPS->pc);
+	}
+	return 0;
+}
+
+static int Hook_rezel_cross_download_frame() {
+	const u32 fb_address = Memory::Read_U32(currentMIPS->r[MIPS_REG_SP] + 0x1C);
+	const u32 fmt = Memory::Read_U32(currentMIPS->r[MIPS_REG_SP] + 0x14);
+	const u32 sz = fmt == GE_FORMAT_8888 ? 0x00088000 : 0x00044000;
+	if (Memory::IsVRAMAddress(fb_address) && fmt <= 3) {
+		gpu->PerformMemoryDownload(fb_address, sz);
+		CBreakPoints::ExecMemCheck(fb_address, true, sz, currentMIPS->pc);
+	}
+	return 0;
+}
+
+static int Hook_kagaku_no_ensemble_download_frame() {
+	const u32 fb_address = currentMIPS->r[MIPS_REG_V0];
+	if (Memory::IsVRAMAddress(fb_address)) {
+		gpu->PerformMemoryDownload(fb_address, 0x00088000);
+		CBreakPoints::ExecMemCheck(fb_address, true, 0x00088000, currentMIPS->pc);
+	}
+	return 0;
+}
+
+static int Hook_soranokiseki_fc_download_frame() {
+	const u32 fb_address = currentMIPS->r[MIPS_REG_A2];
+	if (Memory::IsVRAMAddress(fb_address)) {
+		gpu->PerformMemoryDownload(fb_address, 0x00044000);
+		CBreakPoints::ExecMemCheck(fb_address, true, 0x00044000, currentMIPS->pc);
+	}
+	return 0;
+}
+
+static int Hook_soranokiseki_sc_download_frame() {
+	u32 fb_infoaddr;
+	if (!GetMIPSStaticAddress(fb_infoaddr, 0x28, 0x2C)) {
+		return 0;
+	}
+	const u32 fb_info = Memory::Read_U32(fb_infoaddr);
+	const MIPSOpcode fb_index_load = Memory::Read_Instruction(currentMIPS->pc + 0x34, true);
+	if (fb_index_load != MIPS_MAKE_LW(MIPS_GET_RT(fb_index_load), MIPS_GET_RS(fb_index_load), fb_index_load & 0xffff)) {
+		return 0;
+	}
+	const int fb_index_offset = (s16)(fb_index_load & 0xffff);
+	const u32 fb_index = (Memory::Read_U32(fb_info + fb_index_offset) + 1) & 1;
+	const u32 fb_address = 0x4000000 + (0x44000 * fb_index);
+	const u32 dest_address = currentMIPS->r[MIPS_REG_A1];
+	if (Memory::IsRAMAddress(dest_address)) {
+		gpu->PerformMemoryDownload(fb_address, 0x00044000);
+		CBreakPoints::ExecMemCheck(fb_address, true, 0x00044000, currentMIPS->pc);
+	}
+	return 0;
+}
+
+static int Hook_bokunonatsuyasumi4_download_frame() {
+	const u32 fb_address = currentMIPS->r[MIPS_REG_A3];
+	if (Memory::IsVRAMAddress(fb_address)) {
+		gpu->PerformMemoryDownload(fb_address, 0x00044000);
+		CBreakPoints::ExecMemCheck(fb_address, true, 0x00044000, currentMIPS->pc);
+	}
+	return 0;
+}
+
+static int Hook_danganronpa2_1_download_frame() {
+	const u32 fb_base = currentMIPS->r[MIPS_REG_V0];
+	const u32 fb_offset = currentMIPS->r[MIPS_REG_V1];
+	const u32 fb_offset_fix = fb_offset & 0xFFFFFFFC;
+	const u32 fb_address = fb_base + fb_offset_fix;
+	if (Memory::IsVRAMAddress(fb_address)) {
+		gpu->PerformMemoryDownload(fb_address, 0x00088000);
+		CBreakPoints::ExecMemCheck(fb_address, true, 0x00088000, currentMIPS->pc);
+	}
+	return 0;
+}
+
+static int Hook_danganronpa2_2_download_frame() {
+	const u32 fb_base = currentMIPS->r[MIPS_REG_V0];
+	const u32 fb_offset = currentMIPS->r[MIPS_REG_V1];
+	const u32 fb_offset_fix = fb_offset & 0xFFFFFFFC;
+	const u32 fb_address = fb_base + fb_offset_fix;
+	if (Memory::IsVRAMAddress(fb_address)) {
+		gpu->PerformMemoryDownload(fb_address, 0x00088000);
+		CBreakPoints::ExecMemCheck(fb_address, true, 0x00088000, currentMIPS->pc);
+	}
+	return 0;
+}
+
+static int Hook_danganronpa1_1_download_frame() {
+	const u32 fb_base = currentMIPS->r[MIPS_REG_A5];
+	const u32 fb_offset = currentMIPS->r[MIPS_REG_V0];
+	const u32 fb_offset_fix = fb_offset & 0xFFFFFFFC;
+	const u32 fb_address = fb_base + fb_offset_fix;
+	if (Memory::IsVRAMAddress(fb_address)) {
+		gpu->PerformMemoryDownload(fb_address, 0x00088000);
+		CBreakPoints::ExecMemCheck(fb_address, true, 0x00088000, currentMIPS->pc);
+	}
+	return 0;
+}
+
+static int Hook_danganronpa1_2_download_frame() {
+	const MIPSOpcode instruction = Memory::Read_Instruction(currentMIPS->pc + 0x8, true);
+	const int reg_num = instruction >> 11 & 31;
+	const u32 fb_base = currentMIPS->r[reg_num];
+	const u32 fb_offset = currentMIPS->r[MIPS_REG_V0];
+	const u32 fb_offset_fix = fb_offset & 0xFFFFFFFC;
+	const u32 fb_address = fb_base + fb_offset_fix;
+	if (Memory::IsVRAMAddress(fb_address)) {
+		gpu->PerformMemoryDownload(fb_address, 0x00088000);
+		CBreakPoints::ExecMemCheck(fb_address, true, 0x00088000, currentMIPS->pc);
+	}
+	return 0;
+}
+
+static int Hook_kankabanchoutbr_download_frame() {
+	const u32 fb_address = currentMIPS->r[MIPS_REG_A1];
+	if (Memory::IsVRAMAddress(fb_address)) {
+		gpu->PerformMemoryDownload(fb_address, 0x00044000);
+		CBreakPoints::ExecMemCheck(fb_address, true, 0x00044000, currentMIPS->pc);
+	}
+	return 0;
+}
+
+static int Hook_orenoimouto_download_frame_2() {
+	const u32 fb_address = currentMIPS->r[MIPS_REG_A4];
+	if (Memory::IsVRAMAddress(fb_address)) {
+		gpu->PerformMemoryDownload(fb_address, 0x00088000);
+		CBreakPoints::ExecMemCheck(fb_address, true, 0x00088000, currentMIPS->pc);
+	}
+	return 0;
+}
+
+static int Hook_rewrite_download_frame() {
+	const u32 fb_address = currentMIPS->r[MIPS_REG_A0];
+	if (Memory::IsVRAMAddress(fb_address)) {
+		gpu->PerformMemoryDownload(fb_address, 0x00088000);
+		CBreakPoints::ExecMemCheck(fb_address, true, 0x00088000, currentMIPS->pc);
+	}
+	return 0;
+}
+
+static int Hook_kudwafter_download_frame() {
+	const u32 fb_address = currentMIPS->r[MIPS_REG_A0];
+	if (Memory::IsVRAMAddress(fb_address)) {
+		gpu->PerformMemoryDownload(fb_address, 0x00088000);
+		CBreakPoints::ExecMemCheck(fb_address, true, 0x00088000, currentMIPS->pc);
+	}
+	return 0;
+}
+
+static int Hook_kumonohatateni_download_frame() {
+	const u32 fb_address = currentMIPS->r[MIPS_REG_A0];
+	if (Memory::IsVRAMAddress(fb_address)) {
+		gpu->PerformMemoryDownload(fb_address, 0x00088000);
+		CBreakPoints::ExecMemCheck(fb_address, true, 0x00088000, currentMIPS->pc);
+}
+	return 0;
+}
+
+static int Hook_otomenoheihou_download_frame() {
+	const u32 fb_address = currentMIPS->r[MIPS_REG_A0];
+	if (Memory::IsVRAMAddress(fb_address)) {
+		gpu->PerformMemoryDownload(fb_address, 0x00088000);
+		CBreakPoints::ExecMemCheck(fb_address, true, 0x00088000, currentMIPS->pc);
+}
+	return 0;
+}
+
+static int Hook_grisaianokajitsu_download_frame() {
+	const u32 fb_address = currentMIPS->r[MIPS_REG_A0];
+	if (Memory::IsVRAMAddress(fb_address)) {
+		gpu->PerformMemoryDownload(fb_address, 0x00088000);
+		CBreakPoints::ExecMemCheck(fb_address, true, 0x00088000, currentMIPS->pc);
+	}
+	return 0;
+}
+
+static int Hook_kokoroconnect_download_frame() {
+	const u32 fb_address = currentMIPS->r[MIPS_REG_A3];
+	if (Memory::IsVRAMAddress(fb_address)) {
+		gpu->PerformMemoryDownload(fb_address, 0x00088000);
+		CBreakPoints::ExecMemCheck(fb_address, true, 0x00088000, currentMIPS->pc);
+	}
+	return 0;
+}
+
+static int Hook_toheart2_download_frame() {
+	const u32 fb_address = currentMIPS->r[MIPS_REG_A1];
+	if (Memory::IsVRAMAddress(fb_address)) {
+		gpu->PerformMemoryDownload(fb_address, 0x00044000);
+		CBreakPoints::ExecMemCheck(fb_address, true, 0x00044000, currentMIPS->pc);
+}
+	return 0;
+}
+
+static int Hook_toheart2_download_frame_2() {
+	const u32 fb_address = currentMIPS->r[MIPS_REG_A0];
+	if (Memory::IsVRAMAddress(fb_address)) {
+		gpu->PerformMemoryDownload(fb_address, 0x00088000);
+		CBreakPoints::ExecMemCheck(fb_address, true, 0x00088000, currentMIPS->pc);
+	}
+	return 0;
+}
+
+static int Hook_flowers_download_frame() {
+	const u32 fb_address = currentMIPS->r[MIPS_REG_A0];
+	if (Memory::IsVRAMAddress(fb_address)) {
+		gpu->PerformMemoryDownload(fb_address, 0x00088000);
+		CBreakPoints::ExecMemCheck(fb_address, true, 0x00088000, currentMIPS->pc);
+	}
+	return 0;
+}
+
+static int Hook_motorstorm_download_frame() {
+	const u32 fb_address = Memory::Read_U32(currentMIPS->r[MIPS_REG_A1] + 0x18);
+	if (Memory::IsVRAMAddress(fb_address)) {
+		gpu->PerformMemoryDownload(fb_address, 0x00088000);
+		CBreakPoints::ExecMemCheck(fb_address, true, 0x00088000, currentMIPS->pc);
+	}
+	return 0;
+}
+
+static int Hook_utawarerumono_download_frame() {
+	const u32 fb_address = currentMIPS->r[MIPS_REG_A0];
+	if (Memory::IsVRAMAddress(fb_address)) {
+		gpu->PerformMemoryDownload(fb_address, 0x00088000);
+		CBreakPoints::ExecMemCheck(fb_address, true, 0x00088000, currentMIPS->pc);
+}
+	return 0;
+}
+
+static int Hook_photokano_download_frame() {
+	const u32 fb_address = currentMIPS->r[MIPS_REG_A1];
+	if (Memory::IsVRAMAddress(fb_address)) {
+		gpu->PerformMemoryDownload(fb_address, 0x00088000);
+		CBreakPoints::ExecMemCheck(fb_address, true, 0x00088000, currentMIPS->pc);
+	}
+	return 0;
+}
+
+static int Hook_photokano_download_frame_2() {
+	const u32 fb_address = currentMIPS->r[MIPS_REG_A1];
+	if (Memory::IsVRAMAddress(fb_address)) {
+		gpu->PerformMemoryDownload(fb_address, 0x00088000);
+		CBreakPoints::ExecMemCheck(fb_address, true, 0x00088000, currentMIPS->pc);
+	}
+	return 0;
+}
+
+static int Hook_gakuenheaven_download_frame() {
+	const u32 fb_address = currentMIPS->r[MIPS_REG_A0];
+	if (Memory::IsVRAMAddress(fb_address)) {
+		gpu->PerformMemoryDownload(fb_address, 0x00088000);
+		CBreakPoints::ExecMemCheck(fb_address, true, 0x00088000, currentMIPS->pc);
+}
+	return 0;
+}
+
+static int Hook_youkosohitsujimura_download_frame() {
+	const u32 fb_address = currentMIPS->r[MIPS_REG_V0];
+	if (Memory::IsVRAMAddress(fb_address)) {
+		gpu->PerformMemoryDownload(fb_address, 0x00088000);
+		CBreakPoints::ExecMemCheck(fb_address, true, 0x00088000, currentMIPS->pc);
+}
+	return 0;
+}
+
+#ifdef ARM
+#define JITFUNC(f) (&MIPSComp::ArmJit::f)
+#elif defined(ARM64)
+#define JITFUNC(f) (&MIPSComp::Arm64Jit::f)
+#elif defined(_M_X64) || defined(_M_IX86)
+#define JITFUNC(f) (&MIPSComp::Jit::f)
+#elif defined(MIPS)
+#define JITFUNC(f) (&MIPSComp::Jit::f)
+#else
+#define JITFUNC(f) (&MIPSComp::FakeJit::f)
+#endif
 
 // Can either replace with C functions or functions emitted in Asm/ArmAsm.
 static const ReplacementTableEntry entries[] = {
@@ -548,55 +1042,101 @@ static const ReplacementTableEntry entries[] = {
 	// should of course be implemented JIT style, inline.
 
 	/*  These two collide (same hash) and thus can't be replaced :/
-	{ "asinf", &Replace_asinf, 0, 0},
-	{ "acosf", &Replace_acosf, 0, 0},
+	{ "asinf", &Replace_asinf, 0, REPFLAG_DISABLED },
+	{ "acosf", &Replace_acosf, 0, REPFLAG_DISABLED },
 	*/
 
-	{ "sinf", &Replace_sinf, 0, 0},
-	{ "cosf", &Replace_cosf, 0, 0},
-	{ "tanf", &Replace_tanf, 0, 0},
+	{ "sinf", &Replace_sinf, 0, REPFLAG_DISABLED },
+	{ "cosf", &Replace_cosf, 0, REPFLAG_DISABLED },
+	{ "tanf", &Replace_tanf, 0, REPFLAG_DISABLED },
+	{ "atanf", &Replace_atanf, 0, REPFLAG_DISABLED },
+	{ "sqrtf", &Replace_sqrtf, 0, REPFLAG_DISABLED },
+	{ "atan2f", &Replace_atan2f, 0, REPFLAG_DISABLED },
+	{ "floorf", &Replace_floorf, 0, REPFLAG_DISABLED },
+	{ "ceilf", &Replace_ceilf, 0, REPFLAG_DISABLED },
 
-	{ "atanf", &Replace_atanf, 0, 0},
-	{ "sqrtf", &Replace_sqrtf, 0, 0},
-	{ "atan2f", &Replace_atan2f, 0, 0},
-	{ "floorf", &Replace_floorf, 0, 0},
-	{ "ceilf", &Replace_ceilf, 0, 0},
-	{ "memcpy", &Replace_memcpy, 0, 0},
-	{ "memcpy16", &Replace_memcpy16, 0, 0},
-	{ "memcpy_swizzled", &Replace_memcpy_swizzled, 0, 0},
-	{ "memmove", &Replace_memmove, 0, 0},
-	{ "memset", &Replace_memset, 0, 0},
-	{ "strlen", &Replace_strlen, 0, 0},
-	{ "strcpy", &Replace_strcpy, 0, 0},
-	{ "strncpy", &Replace_strncpy, 0, 0},
-	{ "strcmp", &Replace_strcmp, 0, 0},
-	{ "strncmp", &Replace_strncmp, 0, 0},
-	{ "fabsf", &Replace_fabsf, &MIPSComp::Jit::Replace_fabsf, REPFLAG_ALLOWINLINE},
-	{ "dl_write_matrix", &Replace_dl_write_matrix, 0, 0}, // &MIPSComp::Jit::Replace_dl_write_matrix, 0},
-	{ "dl_write_matrix_2", &Replace_dl_write_matrix, 0, 0},
-	{ "gta_dl_write_matrix", &Replace_gta_dl_write_matrix, 0, 0},
+	{ "memcpy", &Replace_memcpy, 0, 0 },
+	{ "memcpy_jak", &Replace_memcpy_jak, 0, 0 },
+	{ "memcpy16", &Replace_memcpy16, 0, 0 },
+	{ "memcpy_swizzled", &Replace_memcpy_swizzled, 0, 0 },
+	{ "memmove", &Replace_memmove, 0, 0 },
+	{ "memset", &Replace_memset, 0, 0 },
+	{ "memset_jak", &Replace_memset_jak, 0, 0 },
+	{ "strlen", &Replace_strlen, 0, REPFLAG_DISABLED },
+	{ "strcpy", &Replace_strcpy, 0, REPFLAG_DISABLED },
+	{ "strncpy", &Replace_strncpy, 0, REPFLAG_DISABLED },
+	{ "strcmp", &Replace_strcmp, 0, REPFLAG_DISABLED },
+	{ "strncmp", &Replace_strncmp, 0, REPFLAG_DISABLED },
+	{ "fabsf", &Replace_fabsf, JITFUNC(Replace_fabsf), REPFLAG_ALLOWINLINE | REPFLAG_DISABLED },
+	{ "dl_write_matrix", &Replace_dl_write_matrix, 0, REPFLAG_DISABLED }, // &MIPSComp::Jit::Replace_dl_write_matrix, REPFLAG_DISABLED },
+	{ "dl_write_matrix_2", &Replace_dl_write_matrix, 0, REPFLAG_DISABLED },
+	{ "gta_dl_write_matrix", &Replace_gta_dl_write_matrix, 0, REPFLAG_DISABLED },
 	// dl_write_matrix_3 doesn't take the dl as a parameter, it accesses a global instead. Need to extract the address of the global from the code when replacing...
 	// Haven't investigated write_matrix_4 and 5 but I think they are similar to 1 and 2.
 
-	// { "vmmul_q_transp", &Replace_vmmul_q_transp, 0, 0},
+	// { "vmmul_q_transp", &Replace_vmmul_q_transp, 0, REPFLAG_DISABLED },
 
-	{ "godseaterburst_blit_texture", &Hook_godseaterburst_blit_texture, 0, REPFLAG_HOOKENTER},
-	{ "hexyzforce_monoclome_thread", &Hook_hexyzforce_monoclome_thread, 0, REPFLAG_HOOKENTER, 0x58},
-	{ "starocean_write_stencil", &Hook_starocean_write_stencil, 0, REPFLAG_HOOKENTER, 0x260},
-	{ "topx_create_saveicon", &Hook_topx_create_saveicon, 0, REPFLAG_HOOKENTER, 0x34},
-	{ "ff1_battle_effect", &Hook_ff1_battle_effect, 0, REPFLAG_HOOKENTER},
-	{ "dissidia_recordframe_avi", &Hook_dissidia_recordframe_avi, 0, REPFLAG_HOOKENTER},
+	{ "godseaterburst_blit_texture", &Hook_godseaterburst_blit_texture, 0, REPFLAG_HOOKENTER },
+	{ "hexyzforce_monoclome_thread", &Hook_hexyzforce_monoclome_thread, 0, REPFLAG_HOOKENTER, 0x58 },
+	{ "starocean_write_stencil", &Hook_starocean_write_stencil, 0, REPFLAG_HOOKENTER, 0x260 },
+	{ "topx_create_saveicon", &Hook_topx_create_saveicon, 0, REPFLAG_HOOKENTER, 0x34 },
+	{ "ff1_battle_effect", &Hook_ff1_battle_effect, 0, REPFLAG_HOOKENTER },
+	// This is actually used in other games, not just Dissidia.
+	{ "dissidia_recordframe_avi", &Hook_dissidia_recordframe_avi, 0, REPFLAG_HOOKENTER },
+	{ "brandish_download_frame", &Hook_brandish_download_frame, 0, REPFLAG_HOOKENTER },
+	{ "growlanser_create_saveicon", &Hook_growlanser_create_saveicon, 0, REPFLAG_HOOKENTER, 0x7C },
+	{ "sd_gundam_g_generation_download_frame", &Hook_sd_gundam_g_generation_download_frame, 0, REPFLAG_HOOKENTER, 0x48},
+	{ "narisokonai_download_frame", &Hook_narisokonai_download_frame, 0, REPFLAG_HOOKENTER, 0x14 },
+	{ "kirameki_school_life_download_frame", &Hook_kirameki_school_life_download_frame, 0, REPFLAG_HOOKENTER },
+	{ "orenoimouto_download_frame", &Hook_orenoimouto_download_frame, 0, REPFLAG_HOOKENTER },
+	{ "sakurasou_download_frame", &Hook_sakurasou_download_frame, 0, REPFLAG_HOOKENTER, 0xF8 },
+	{ "suikoden1_and_2_download_frame_1", &Hook_suikoden1_and_2_download_frame_1, 0, REPFLAG_HOOKENTER, 0x9C },
+	{ "suikoden1_and_2_download_frame_2", &Hook_suikoden1_and_2_download_frame_2, 0, REPFLAG_HOOKENTER, 0x48 },
+	{ "rezel_cross_download_frame", &Hook_rezel_cross_download_frame, 0, REPFLAG_HOOKENTER, 0x54 },
+	{ "kagaku_no_ensemble_download_frame", &Hook_kagaku_no_ensemble_download_frame, 0, REPFLAG_HOOKENTER, 0x38 },
+	{ "soranokiseki_fc_download_frame", &Hook_soranokiseki_fc_download_frame, 0, REPFLAG_HOOKENTER, 0x180 },
+	{ "soranokiseki_sc_download_frame", &Hook_soranokiseki_sc_download_frame, 0, REPFLAG_HOOKENTER, },
+	{ "bokunonatsuyasumi4_download_frame", &Hook_bokunonatsuyasumi4_download_frame, 0, REPFLAG_HOOKENTER, 0x8C },
+	{ "danganronpa2_1_download_frame", &Hook_danganronpa2_1_download_frame, 0, REPFLAG_HOOKENTER, 0x68 },
+	{ "danganronpa2_2_download_frame", &Hook_danganronpa2_2_download_frame, 0, REPFLAG_HOOKENTER, 0x94 },
+	{ "danganronpa1_1_download_frame", &Hook_danganronpa1_1_download_frame, 0, REPFLAG_HOOKENTER, 0x78 },
+	{ "danganronpa1_2_download_frame", &Hook_danganronpa1_2_download_frame, 0, REPFLAG_HOOKENTER, 0xA8 },
+	{ "kankabanchoutbr_download_frame", &Hook_kankabanchoutbr_download_frame, 0, REPFLAG_HOOKENTER, },
+	{ "orenoimouto_download_frame_2", &Hook_orenoimouto_download_frame_2, 0, REPFLAG_HOOKENTER, },
+	{ "rewrite_download_frame", &Hook_rewrite_download_frame, 0, REPFLAG_HOOKENTER, 0x5C },
+	{ "kudwafter_download_frame", &Hook_kudwafter_download_frame, 0, REPFLAG_HOOKENTER, 0x58 },
+	{ "kumonohatateni_download_frame", &Hook_kumonohatateni_download_frame, 0, REPFLAG_HOOKENTER, },
+	{ "otomenoheihou_download_frame", &Hook_otomenoheihou_download_frame, 0, REPFLAG_HOOKENTER, 0x14 },
+	{ "grisaianokajitsu_download_frame", &Hook_grisaianokajitsu_download_frame, 0, REPFLAG_HOOKENTER, 0x14 },
+	{ "kokoroconnect_download_frame", &Hook_kokoroconnect_download_frame, 0, REPFLAG_HOOKENTER, 0x60 },
+	{ "toheart2_download_frame", &Hook_toheart2_download_frame, 0, REPFLAG_HOOKENTER, },
+	{ "toheart2_download_frame_2", &Hook_toheart2_download_frame_2, 0, REPFLAG_HOOKENTER, 0x18 },
+	{ "flowers_download_frame", &Hook_flowers_download_frame, 0, REPFLAG_HOOKENTER, 0x44 },
+	{ "motorstorm_download_frame", &Hook_motorstorm_download_frame, 0, REPFLAG_HOOKENTER, },
+	{ "utawarerumono_download_frame", &Hook_utawarerumono_download_frame, 0, REPFLAG_HOOKENTER, },
+	{ "photokano_download_frame", &Hook_photokano_download_frame, 0, REPFLAG_HOOKENTER, 0x2C },
+	{ "photokano_download_frame_2", &Hook_photokano_download_frame_2, 0, REPFLAG_HOOKENTER, },
+	{ "gakuenheaven_download_frame", &Hook_gakuenheaven_download_frame, 0, REPFLAG_HOOKENTER, },
+	{ "youkosohitsujimura_download_frame", &Hook_youkosohitsujimura_download_frame, 0, REPFLAG_HOOKENTER, 0x94 },
 	{}
 };
 
 
 static std::map<u32, u32> replacedInstructions;
+static std::map<std::string, std::vector<int> > replacementNameLookup;
 
 void Replacement_Init() {
+	for (int i = 0; i < (int)ARRAY_SIZE(entries); i++) {
+		const auto entry = &entries[i];
+		if (!entry->name || (entry->flags & REPFLAG_DISABLED) != 0)
+			continue;
+		replacementNameLookup[entry->name].push_back(i);
+	}
 }
 
 void Replacement_Shutdown() {
 	replacedInstructions.clear();
+	replacementNameLookup.clear();
 }
 
 // TODO: Do something on load state?
@@ -605,21 +1145,18 @@ int GetNumReplacementFuncs() {
 	return ARRAY_SIZE(entries);
 }
 
-int GetReplacementFuncIndex(u64 hash, int funcSize) {
+std::vector<int> GetReplacementFuncIndexes(u64 hash, int funcSize) {
 	const char *name = MIPSAnalyst::LookupHash(hash, funcSize);
+	std::vector<int> emptyResult;
 	if (!name) {
-		return -1;
+		return emptyResult;
 	}
 
-	// TODO: Build a lookup and keep it around
-	for (size_t i = 0; i < ARRAY_SIZE(entries); i++) {
-		if (!entries[i].name)
-			continue;
-		if (!strcmp(name, entries[i].name)) {
-			return (int)i;
-		}
+	auto index = replacementNameLookup.find(name);
+	if (index != replacementNameLookup.end()) {
+		return index->second;
 	}
-	return -1;
+	return emptyResult;
 }
 
 const ReplacementTableEntry *GetReplacementFunc(int i) {
@@ -640,8 +1177,8 @@ static void WriteReplaceInstruction(u32 address, int index) {
 }
 
 void WriteReplaceInstructions(u32 address, u64 hash, int size) {
-	int index = GetReplacementFuncIndex(hash, size);
-	if (index >= 0) {
+	std::vector<int> indexes = GetReplacementFuncIndexes(hash, size);
+	for (int index : indexes) {
 		auto entry = GetReplacementFunc(index);
 		if (entry->flags & REPFLAG_HOOKEXIT) {
 			// When hooking func exit, we search for jr ra, and replace those.
@@ -721,4 +1258,36 @@ bool GetReplacedOpAt(u32 address, u32 *op) {
 		}
 	}
 	return false;
+}
+
+bool CanReplaceJalTo(u32 dest, const ReplacementTableEntry **entry, u32 *funcSize) {
+	MIPSOpcode op(Memory::Read_Opcode_JIT(dest));
+	if (!MIPS_IS_REPLACEMENT(op.encoding))
+		return false;
+
+	// Make sure we don't replace if there are any breakpoints inside.
+	*funcSize = symbolMap.GetFunctionSize(dest);
+	if (*funcSize == SymbolMap::INVALID_ADDRESS) {
+		if (CBreakPoints::IsAddressBreakPoint(dest)) {
+			return false;
+		}
+		*funcSize = (u32)sizeof(u32);
+	} else {
+		if (CBreakPoints::RangeContainsBreakPoint(dest, *funcSize)) {
+			return false;
+		}
+	}
+
+	int index = op.encoding & MIPS_EMUHACK_VALUE_MASK;
+	*entry = GetReplacementFunc(index);
+	if (!*entry) {
+		ERROR_LOG(HLE, "ReplaceJalTo: Invalid replacement op %08x at %08x", op.encoding, dest);
+		return false;
+	}
+
+	if ((*entry)->flags & (REPFLAG_HOOKENTER | REPFLAG_HOOKEXIT | REPFLAG_DISABLED)) {
+		// If it's a hook, we can't replace the jal, we have to go inside the func.
+		return false;
+	}
+	return true;
 }

@@ -1,4 +1,3 @@
-
 // Copyright (c) 2013- PPSSPP Project.
 
 // This program is free software: you can redistribute it and/or modify
@@ -175,9 +174,9 @@ void Lighter::Light(float colorOut0[4], float colorOut1[4], const float colorIn[
 		}
 	}
 
-	// 4?
+	// The colors must eventually be clamped, but we expect the caller to do that.
 	for (int i = 0; i < 4; i++) {
-		colorOut0[i] = lightSum0[i] > 1.0f ? 1.0f : lightSum0[i];
-		colorOut1[i] = lightSum1[i] > 1.0f ? 1.0f : lightSum1[i];
+		colorOut0[i] = lightSum0[i];
+		colorOut1[i] = lightSum1[i];
 	}
 }

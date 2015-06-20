@@ -24,7 +24,6 @@
 namespace MIPSCodeUtils
 {
 
-#define FULLOP_JR_RA 0x03e00008
 #define OP_SYSCALL   0x0000000c
 #define OP_SYSCALL_MASK 0xFC00003F
 #define _RS   ((op>>21) & 0x1F)
@@ -93,7 +92,7 @@ namespace MIPSCodeUtils
 		if (op != 0)
 		{
 			MIPSInfo info = MIPSGetInfo(op);
-			if (info & IS_CONDBRANCH)
+			if ((info & IS_CONDBRANCH) && !(info & (IN_FPUFLAG | IS_VFPU)))
 			{
 				bool sure;
 				bool takeBranch;
@@ -146,4 +145,6 @@ namespace MIPSCodeUtils
 	bool IsBranch(MIPSOpcode op) {
 		return (MIPSGetInfo(op) & IS_CONDBRANCH) == IS_CONDBRANCH;
 	}
+
+
 }

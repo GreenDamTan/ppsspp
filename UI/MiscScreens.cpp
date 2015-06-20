@@ -15,17 +15,19 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
+#include <algorithm>
+
+#include "base/functional.h"
 #include "base/colorutil.h"
 #include "base/timeutil.h"
 #include "gfx_es2/draw_buffer.h"
-#include "gfx_es2/gl_state.h"
-#include "file/vfs.h"
 #include "math/curves.h"
 #include "i18n/i18n.h"
 #include "ui/ui_context.h"
 #include "ui/view.h"
 #include "ui/viewgroup.h"
 #include "ui/ui.h"
+#include "file/vfs.h"
 #include "UI/MiscScreens.h"
 #include "UI/EmuScreen.h"
 #include "UI/MainScreen.h"
@@ -34,6 +36,7 @@
 #include "Core/Host.h"
 #include "Core/System.h"
 #include "Core/MIPS/JitCommon/JitCommon.h"
+#include "Core/MIPS/JitCommon/NativeJit.h"
 #include "Core/HLE/sceUtility.h"
 #include "Common/CPUDetect.h"
 #include "Common/FileUtil.h"
@@ -42,7 +45,6 @@
 #include "ui_atlas.h"
 
 #ifdef _MSC_VER
-#define snprintf _snprintf
 #pragma execution_character_set("utf-8")
 #endif
 
@@ -85,11 +87,7 @@ void DrawBackground(UIContext &dc, float alpha = 1.0f) {
 		last_xres = xres;
 		last_yres = yres;
 	}
-
-	glstate.depthWrite.set(GL_TRUE);
-	glstate.colorMask.set(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-	glClearColor(0.1f, 0.2f, 0.43f, 1.0f);
-	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+	
 	int img = I_BG;
 #ifdef GOLD
 	img = I_BG_GOLD;
@@ -106,18 +104,18 @@ void DrawBackground(UIContext &dc, float alpha = 1.0f) {
 }
 
 void DrawGameBackground(UIContext &dc, const std::string &gamePath) {
-	GameInfo *ginfo = g_gameInfoCache.GetInfo(gamePath, GAMEINFO_WANTBG);
+	GameInfo *ginfo = g_gameInfoCache.GetInfo(dc.GetThin3DContext(), gamePath, GAMEINFO_WANTBG);
 	dc.Flush();
 
 	if (ginfo) {
 		bool hasPic = false;
 		double loadTime;
 		if (ginfo->pic1Texture) {
-			ginfo->pic1Texture->Bind(0);
+			dc.GetThin3DContext()->SetTexture(0, ginfo->pic1Texture);
 			loadTime = ginfo->timePic1WasLoaded;
 			hasPic = true;
 		} else if (ginfo->pic0Texture) {
-			ginfo->pic0Texture->Bind(0);
+			dc.GetThin3DContext()->SetTexture(0, ginfo->pic0Texture);
 			loadTime = ginfo->timePic0WasLoaded;
 			hasPic = true;
 		}
@@ -151,7 +149,12 @@ void UIScreenWithBackground::DrawBackground(UIContext &dc) {
 }
 
 void UIScreenWithGameBackground::DrawBackground(UIContext &dc) {
-	DrawGameBackground(dc, gamePath_);
+	if (!gamePath_.empty()) {
+		DrawGameBackground(dc, gamePath_);
+	} else {
+		::DrawBackground(dc, 1.0f);
+		dc.Flush();
+	}
 }
 
 void UIDialogScreenWithGameBackground::DrawBackground(UIContext &dc) {
@@ -258,7 +261,7 @@ PostProcScreen::PostProcScreen(const std::string &title) : ListPopupScreen(title
 	for (int i = 0; i < (int)shaders_.size(); i++) {
 		if (shaders_[i].section == g_Config.sPostShaderName)
 			selected = i;
-		items.push_back(ps->T(shaders_[i].name.c_str()));
+		items.push_back(ps->T(shaders_[i].section.c_str()));
 	}
 	adaptor_ = UI::StringVectorListAdaptor(items, selected);
 }
@@ -290,6 +293,10 @@ NewLanguageScreen::NewLanguageScreen(const std::string &title) : ListPopupScreen
 #ifndef _WIN32
 		// ar_AE only works on Windows.
 		if (tempLangs[i].name.find("ar_AE") != std::string::npos) {
+			continue;
+		}
+		// Farsi also only works on Windows.
+		if (tempLangs[i].name.find("fa_IR") != std::string::npos) {
 			continue;
 		}
 #endif
@@ -339,7 +346,7 @@ void NewLanguageScreen::OnCompleted(DialogResult result) {
 	bool iniLoadedSuccessfully = false;
 	// Allow the lang directory to be overridden for testing purposes (e.g. Android, where it's hard to 
 	// test new languages without recompiling the entire app, which is a hassle).
-	const std::string langOverridePath = g_Config.memCardDirectory + "PSP/SYSTEM/lang/";
+	const std::string langOverridePath = g_Config.memStickDirectory + "PSP/SYSTEM/lang/";
 
 	// If we run into the unlikely case that "lang" is actually a file, just use the built-in translations.
 	if (!File::Exists(langOverridePath) || !File::IsDirectory(langOverridePath))
@@ -396,7 +403,6 @@ bool LogoScreen::key(const KeyInput &key) {
 
 void LogoScreen::render() {
 	UIScreen::render();
-
 	UIContext &dc = *screenManager()->getUIContext();
 
 	const Bounds &bounds = dc.GetBounds();
@@ -418,7 +424,8 @@ void LogoScreen::render() {
 
 	I18NCategory *c = GetI18NCategory("PSPCredits");
 	char temp[256];
-	sprintf(temp, "%s Henrik Rydg\xc3\xa5rd", c->T("created", "Created by"));
+	// Manually formatting utf-8 is fun.  \xXX doesn't work everywhere.
+	snprintf(temp, sizeof(temp), "%s Henrik Rydg%c%crd", c->T("created", "Created by"), 0xC3, 0xA5);
 #ifdef GOLD
 	dc.Draw()->DrawImage(I_ICONGOLD, bounds.centerX() - 120, bounds.centerY() - 30, 1.2f, colorAlpha(0xFFFFFFFF, alphaText), ALIGN_CENTER);
 #else
@@ -426,14 +433,22 @@ void LogoScreen::render() {
 #endif
 	dc.Draw()->DrawImage(I_LOGO, bounds.centerX() + 40, bounds.centerY() - 30, 1.5f, colorAlpha(0xFFFFFFFF, alphaText), ALIGN_CENTER);
 	//dc.Draw()->DrawTextShadow(UBUNTU48, "PPSSPP", xres / 2, yres / 2 - 30, colorAlpha(0xFFFFFFFF, alphaText), ALIGN_CENTER);
-	dc.Draw()->SetFontScale(1.0f, 1.0f);
+	dc.SetFontScale(1.0f, 1.0f);
 	dc.SetFontStyle(dc.theme->uiFont);
 	dc.DrawText(temp, bounds.centerX(), bounds.centerY() + 40, colorAlpha(0xFFFFFFFF, alphaText), ALIGN_CENTER);
 	dc.DrawText(c->T("license", "Free Software under GPL 2.0"), bounds.centerX(), bounds.centerY() + 70, colorAlpha(0xFFFFFFFF, alphaText), ALIGN_CENTER);
 	dc.DrawText("www.ppsspp.org", bounds.centerX(), yres / 2 + 130, colorAlpha(0xFFFFFFFF, alphaText), ALIGN_CENTER);
 	if (boot_filename.size()) {
-		ui_draw2d.DrawTextShadow(UBUNTU24, boot_filename.c_str(), bounds.centerX(), bounds.centerY() + 180, colorAlpha(0xFFFFFFFF, alphaText), ALIGN_CENTER);
+		dc.DrawTextShadow(boot_filename.c_str(), bounds.centerX(), bounds.centerY() + 180, colorAlpha(0xFFFFFFFF, alphaText), ALIGN_CENTER);
 	}
+
+#ifdef _WIN32
+	dc.DrawText(screenManager()->getThin3DContext()->GetInfoString(T3DInfo::APINAME), bounds.centerX(), bounds.y2() - 100, colorAlpha(0xFFFFFFFF, alphaText), ALIGN_CENTER);
+#elif defined(ARM64)
+	dc.SetFontScale(2.0f, 2.0f);
+	dc.DrawText("EXPERIMENTAL ARM64 BUILD", bounds.centerX(), bounds.y2() - 100, colorAlpha(0xFF3030FF, alphaText), ALIGN_CENTER);
+	dc.SetFontScale(1.0f, 1.0f);
+#endif
 
 	dc.End();
 	dc.Flush();
@@ -451,15 +466,8 @@ void CreditsScreen::CreateViews() {
 #ifndef GOLD
 	root_->Add(new Button(c->T("Buy Gold"), new AnchorLayoutParams(260, 64, 10, NONE, NONE, 10, false)))->OnClick.Handle(this, &CreditsScreen::OnSupport);
 #endif
-	if (g_Config.sLanguageIni == "zh_CN" ||g_Config.sLanguageIni == "zh_TW") {
-		root_->Add(new Button(c->T("PPSSPP Chinese Forum"), new AnchorLayoutParams(260, 64, 10, NONE, NONE, 84, false)))->OnClick.Handle(this, &CreditsScreen::OnChineseForum);
-		root_->Add(new Button(c->T("PPSSPP Forums"), new AnchorLayoutParams(260, 64, 10, NONE, NONE, 154, false)))->OnClick.Handle(this, &CreditsScreen::OnForums);
-		root_->Add(new Button("www.ppsspp.org", new AnchorLayoutParams(260, 64, 10, NONE, NONE, 228, false)))->OnClick.Handle(this, &CreditsScreen::OnPPSSPPOrg);
-	}
-	else {
-		root_->Add(new Button(c->T("PPSSPP Forums"), new AnchorLayoutParams(260, 64, 10, NONE, NONE, 84, false)))->OnClick.Handle(this, &CreditsScreen::OnForums);
-		root_->Add(new Button("www.ppsspp.org", new AnchorLayoutParams(260, 64, 10, NONE, NONE, 158, false)))->OnClick.Handle(this, &CreditsScreen::OnPPSSPPOrg);
-	}
+	root_->Add(new Button(c->T("PPSSPP Forums"), new AnchorLayoutParams(260, 64, 10, NONE, NONE, 84, false)))->OnClick.Handle(this, &CreditsScreen::OnForums);
+	root_->Add(new Button("www.ppsspp.org", new AnchorLayoutParams(260, 64, 10, NONE, NONE, 158, false)))->OnClick.Handle(this, &CreditsScreen::OnPPSSPPOrg);
 #ifdef ANDROID
 	root_->Add(new Button(c->T("Share PPSSPP"), new AnchorLayoutParams(260, 64, NONE, NONE, 10, 84, false)))->OnClick.Handle(this, &CreditsScreen::OnShare);
 	root_->Add(new Button(c->T("Twitter @PPSSPP_emu"), new AnchorLayoutParams(260, 64, NONE, NONE, 10, 154, false)))->OnClick.Handle(this, &CreditsScreen::OnTwitter);
@@ -496,11 +504,6 @@ UI::EventReturn CreditsScreen::OnPPSSPPOrg(UI::EventParams &e) {
 
 UI::EventReturn CreditsScreen::OnForums(UI::EventParams &e) {
 	LaunchBrowser("http://forums.ppsspp.org");
-	return UI::EVENT_DONE;
-}
-
-UI::EventReturn CreditsScreen::OnChineseForum(UI::EventParams &e) {
-	LaunchBrowser("http://tieba.baidu.com/f?ie=utf-8&kw=ppsspp");
 	return UI::EVENT_DONE;
 }
 
@@ -637,7 +640,7 @@ void CreditsScreen::render() {
 
 	// TODO: This is kinda ugly, done on every frame...
 	char temp[256];
-	sprintf(temp, "PPSSPP %s", PPSSPP_GIT_VERSION);
+	snprintf(temp, sizeof(temp), "PPSSPP %s", PPSSPP_GIT_VERSION);
 	credits[0] = (const char *)temp;
 
 	UIContext &dc = *screenManager()->getUIContext();

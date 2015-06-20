@@ -42,6 +42,7 @@
 #include "WindowsHost.h"
 #include "WndMainWindow.h"
 #include "OpenGLBase.h"
+#include "D3D9Base.h"
 
 #include "Windows/Debugger/DebuggerShared.h"
 #include "Windows/Debugger/Debugger_Disasm.h"
@@ -57,8 +58,6 @@
 #include "main.h"
 
 static const int numCPUs = 1;
-
-extern PMixer *g_mixer;
 
 float mouseDeltaX = 0;
 float mouseDeltaY = 0;
@@ -88,14 +87,26 @@ WindowsHost::WindowsHost(HWND mainWindow, HWND displayWindow)
 	SetConsolePosition();
 }
 
-bool WindowsHost::InitGL(std::string *error_message)
-{
-	return GL_Init(displayWindow_, error_message);
+bool WindowsHost::InitGraphics(std::string *error_message) {
+	switch (g_Config.iGPUBackend) {
+	case GPU_BACKEND_OPENGL:
+		return GL_Init(displayWindow_, error_message);
+	case GPU_BACKEND_DIRECT3D9:
+		return D3D9_Init(displayWindow_, true, error_message);
+	default:
+		return false;
+	}
 }
 
-void WindowsHost::ShutdownGL()
-{
-	GL_Shutdown();
+void WindowsHost::ShutdownGraphics() {
+	switch (g_Config.iGPUBackend) {
+	case GPU_BACKEND_OPENGL:
+		GL_Shutdown();
+		break;
+	case GPU_BACKEND_DIRECT3D9:
+		D3D9_Shutdown();
+		break;
+	}
 	PostMessage(mainWindow_, WM_CLOSE, 0, 0);
 }
 
@@ -111,21 +122,21 @@ void WindowsHost::SetWindowTitle(const char *message)
 	PostMessage(mainWindow_, MainWindow::WM_USER_WINDOW_TITLE_CHANGED, 0, 0);
 }
 
-void WindowsHost::InitSound(PMixer *mixer)
+void WindowsHost::InitSound()
 {
-	g_mixer = mixer;
 }
+
+// UGLY!
+extern WindowsAudioBackend *winAudioBackend;
 
 void WindowsHost::UpdateSound()
 {
-	DSound::DSound_UpdateSound();
+	if (winAudioBackend)
+		winAudioBackend->Update();
 }
 
 void WindowsHost::ShutdownSound()
 {
-	if (g_mixer)
-		delete g_mixer;
-	g_mixer = 0;
 }
 
 void WindowsHost::UpdateUI()
@@ -274,7 +285,7 @@ void WindowsHost::UpdateConsolePosition()
 HRESULT CreateLink(LPCWSTR lpszPathObj, LPCWSTR lpszArguments, LPCWSTR lpszPathLink, LPCWSTR lpszDesc) { 
 	HRESULT hres; 
 	IShellLink* psl; 
-	CoInitialize(0);
+	CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
 	// Get a pointer to the IShellLink interface. It is assumed that CoInitialize
 	// has already been called.
@@ -301,6 +312,10 @@ HRESULT CreateLink(LPCWSTR lpszPathObj, LPCWSTR lpszArguments, LPCWSTR lpszPathL
 	CoUninitialize();
 
 	return hres; 
+}
+
+bool WindowsHost::CanCreateShortcut() { 
+	return false;  // Turn on when below function fixed
 }
 
 bool WindowsHost::CreateDesktopShortcut(std::string argumentPath, std::string gameTitle) {

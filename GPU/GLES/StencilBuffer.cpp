@@ -20,6 +20,7 @@
 #include "Core/Reporting.h"
 #include "GPU/GLES/Framebuffer.h"
 #include "GPU/GLES/ShaderManager.h"
+#include "GPU/GLES/TextureCache.h"
 
 static const char *stencil_fs =
 #ifdef USING_GLES2
@@ -103,20 +104,24 @@ bool FramebufferManager::NotifyStencilUpload(u32 addr, int size, bool skipZero) 
 	int values = 0;
 	u8 usedBits = 0;
 
+	const u8 *src = Memory::GetPointer(addr);
+	if (!src)
+		return false;
+
 	switch (dstBuffer->format) {
 	case GE_FORMAT_565:
 		// Well, this doesn't make much sense.
 		return false;
 	case GE_FORMAT_5551:
-		usedBits = StencilBits5551(Memory::GetPointer(addr), dstBuffer->fb_stride * dstBuffer->bufferHeight);
+		usedBits = StencilBits5551(src, dstBuffer->fb_stride * dstBuffer->bufferHeight);
 		values = 2;
 		break;
 	case GE_FORMAT_4444:
-		usedBits = StencilBits4444(Memory::GetPointer(addr), dstBuffer->fb_stride * dstBuffer->bufferHeight);
+		usedBits = StencilBits4444(src, dstBuffer->fb_stride * dstBuffer->bufferHeight);
 		values = 16;
 		break;
 	case GE_FORMAT_8888:
-		usedBits = StencilBits8888(Memory::GetPointer(addr), dstBuffer->fb_stride * dstBuffer->bufferHeight);
+		usedBits = StencilBits8888(src, dstBuffer->fb_stride * dstBuffer->bufferHeight);
 		values = 256;
 		break;
 	case GE_FORMAT_INVALID:
@@ -139,7 +144,6 @@ bool FramebufferManager::NotifyStencilUpload(u32 addr, int size, bool skipZero) 
 		return true;
 	}
 
-	GLSLProgram *program = 0;
 	if (!stencilUploadProgram_) {
 		std::string errorString;
 		stencilUploadProgram_ = glsl_create_source(stencil_vs, stencil_fs, &errorString);
@@ -194,7 +198,8 @@ bool FramebufferManager::NotifyStencilUpload(u32 addr, int size, bool skipZero) 
 	}
 	glViewport(0, 0, w, h);
 
-	MakePixelTexture(Memory::GetPointer(addr), dstBuffer->format, dstBuffer->fb_stride, dstBuffer->bufferWidth, dstBuffer->bufferHeight);
+	MakePixelTexture(src, dstBuffer->format, dstBuffer->fb_stride, dstBuffer->bufferWidth, dstBuffer->bufferHeight);
+	textureCache_->ForgetLastTexture();
 
 	glClearStencil(0);
 	glClear(GL_STENCIL_BUFFER_BIT);
@@ -210,18 +215,18 @@ bool FramebufferManager::NotifyStencilUpload(u32 addr, int size, bool skipZero) 
 		// DrawActiveTexture unbinds it, so rebind here before setting uniforms.
 		glsl_bind(stencilUploadProgram_);
 		if (dstBuffer->format == GE_FORMAT_4444) {
-			glStencilMask(Convert4To8(i));
+			glstate.stencilMask.set((i << 4) | i);
 			glUniform1f(u_stencilValue, i * (16.0f / 255.0f));
 		} else if (dstBuffer->format == GE_FORMAT_5551) {
-			glStencilMask(0xFF);
+			glstate.stencilMask.set(0xFF);
 			glUniform1f(u_stencilValue, i * (128.0f / 255.0f));
 		} else {
-			glStencilMask(i);
+			glstate.stencilMask.set(i);
 			glUniform1f(u_stencilValue, i * (1.0f / 255.0f));
 		}
 		DrawActiveTexture(0, 0, 0, dstBuffer->width, dstBuffer->height, dstBuffer->bufferWidth, dstBuffer->bufferHeight, false, 0.0f, 0.0f, 1.0f, 1.0f, stencilUploadProgram_);
 	}
-	glStencilMask(0xFF);
+	glstate.stencilMask.set(0xFF);
 
 	if (useBlit) {
 		fbo_bind_as_render_target(dstBuffer->fbo);
@@ -235,8 +240,6 @@ bool FramebufferManager::NotifyStencilUpload(u32 addr, int size, bool skipZero) 
 		}
 	}
 
-	fbo_unbind();
 	RebindFramebuffer();
-	glstate.viewport.restore();
 	return true;
 }

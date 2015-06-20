@@ -111,7 +111,7 @@ public:
 	const std::list<int>& GetDisplayLists() {
 		return dlQueue;
 	}
-	virtual bool DecodeTexture(u8* dest, GPUgstate state) {
+	virtual bool DecodeTexture(u8* dest, const GPUgstate &state) {
 		return false;
 	}
 	std::vector<FramebufferInfo> GetFramebufferList() {
@@ -138,6 +138,8 @@ protected:
 	virtual void ProcessEvent(GPUEvent ev);
 	virtual bool ShouldExitEventLoop() {
 		return coreState != CORE_RUNNING;
+	}
+	virtual void FinishDeferred() {
 	}
 
 	// Allows early unlocking with a guard.  Do not double unlock.

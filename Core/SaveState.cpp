@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "base/timeutil.h"
+#include "base/NativeApp.h"
 #include "i18n/i18n.h"
 
 #include "Common/StdMutex.h"
@@ -29,6 +30,7 @@
 #include "Core/Core.h"
 #include "Core/CoreTiming.h"
 #include "Core/Host.h"
+#include "Core/Screenshot.h"
 #include "Core/System.h"
 #include "Core/FileSystems/MetaFileSystem.h"
 #include "Core/ELF/ParamSFO.h"
@@ -38,7 +40,6 @@
 #include "Core/HLE/sceKernel.h"
 #include "Core/MemMap.h"
 #include "Core/MIPS/MIPS.h"
-#include "Core/MIPS/JitCommon/JitCommon.h"
 #include "HW/MemoryStick.h"
 #include "GPU/GPUState.h"
 #include "UI/OnScreenDisplay.h"
@@ -56,6 +57,7 @@ namespace SaveState
 		SAVESTATE_LOAD,
 		SAVESTATE_VERIFY,
 		SAVESTATE_REWIND,
+		SAVESTATE_SAVE_SCREENSHOT,
 	};
 
 	struct Operation
@@ -183,7 +185,7 @@ namespace SaveState
 			next_ = 0;
 		}
 
-		bool Empty()
+		bool Empty() const
 		{
 			return next_ == first_;
 		}
@@ -277,6 +279,11 @@ namespace SaveState
 		Enqueue(Operation(SAVESTATE_REWIND, std::string(""), callback, cbUserData));
 	}
 
+	void SaveScreenshot(const std::string &filename, Callback callback, void *cbUserData)
+	{
+		Enqueue(Operation(SAVESTATE_SAVE_SCREENSHOT, filename, callback, cbUserData));
+	}
+
 	bool CanRewind()
 	{
 		return !rewindStates.Empty();
@@ -289,11 +296,11 @@ namespace SaveState
 	std::string GenerateSaveSlotFilename(int slot, const char *extension)
 	{
 		char discID[256];
-		char temp[256];
-		sprintf(discID, "%s_%s",
+		char temp[2048];
+		snprintf(discID, sizeof(discID), "%s_%s",
 			g_paramSFO.GetValueString("DISC_ID").c_str(),
 			g_paramSFO.GetValueString("DISC_VERSION").c_str());
-		sprintf(temp, "ms0:/PSP/PPSSPP_STATE/%s_%i.%s", discID, slot, extension);
+		snprintf(temp, sizeof(temp), "ms0:/PSP/PPSSPP_STATE/%s_%i.%s", discID, slot, extension);
 		std::string hostPath;
 		if (pspFileSystem.GetHostPath(std::string(temp), hostPath)) {
 			return hostPath;
@@ -302,13 +309,19 @@ namespace SaveState
 		}
 	}
 
+	int GetCurrentSlot()
+	{
+		return g_Config.iCurrentStateSlot;
+	}
+
 	void NextSlot()
 	{
 		I18NCategory *sy = GetI18NCategory("System");
 		g_Config.iCurrentStateSlot = (g_Config.iCurrentStateSlot + 1) % SaveState::SAVESTATESLOTS;
-		char msg[30];
-		sprintf(msg, "%s: %d", sy->T("Savestate Slot"), g_Config.iCurrentStateSlot + 1);
+		char msg[128];
+		snprintf(msg, sizeof(msg), "%s: %d", sy->T("Savestate Slot"), g_Config.iCurrentStateSlot + 1);
 		osm.Show(msg);
+		NativeMessageReceived("slotchanged", "");
 	}
 
 	void LoadSlot(int slot, Callback callback, void *cbUserData)
@@ -317,23 +330,37 @@ namespace SaveState
 		if (!fn.empty()) {
 			Load(fn, callback, cbUserData);
 		} else {
-			I18NCategory *s = GetI18NCategory("Screen");
-			osm.Show("Failed to load state. Error in the file system.", 2.0);
+			I18NCategory *sy = GetI18NCategory("System");
+			osm.Show(sy->T("Failed to load state. Error in the file system."), 2.0);
 			if (callback)
-				(*callback)(false, cbUserData);
+				callback(false, cbUserData);
 		}
 	}
 
 	void SaveSlot(int slot, Callback callback, void *cbUserData)
 	{
 		std::string fn = GenerateSaveSlotFilename(slot, STATE_EXTENSION);
+		std::string shot = GenerateSaveSlotFilename(slot, SCREENSHOT_EXTENSION);
 		if (!fn.empty()) {
-			Save(fn, callback, cbUserData);
+			auto renameCallback = [=](bool status, void *data) {
+				if (status) {
+					if (File::Exists(fn)) {
+						File::Delete(fn);
+					}
+					File::Rename(fn + ".tmp", fn);
+				}
+				if (callback) {
+					callback(status, data);
+				}
+			};
+			// Let's also create a screenshot.
+			SaveScreenshot(shot, Callback(), 0);
+			Save(fn + ".tmp", renameCallback, cbUserData);
 		} else {
 			I18NCategory *s = GetI18NCategory("Screen");
 			osm.Show("Failed to save state. Error in the file system.", 2.0);
 			if (callback)
-				(*callback)(false, cbUserData);
+				callback(false, cbUserData);
 		}
 	}
 
@@ -371,8 +398,9 @@ namespace SaveState
 		for (int i = 0; i < SAVESTATESLOTS; i++) {
 			std::string fn = GenerateSaveSlotFilename(i, STATE_EXTENSION);
 			if (File::Exists(fn)) {
-				tm time = File::GetModifTime(fn);
-				if (newestDate < time) {
+				tm time;
+				bool success = File::GetModifTime(fn, time);
+				if (success && newestDate < time) {
 					newestDate = time;
 					newestSlot = i;
 				}
@@ -381,6 +409,19 @@ namespace SaveState
 		return newestSlot;
 	}
 
+	std::string GetSlotDateAsString(int slot) {
+		std::string fn = GenerateSaveSlotFilename(slot, STATE_EXTENSION);
+		if (File::Exists(fn)) {
+			tm time;
+			if (File::GetModifTime(fn, time)) {
+				char buf[256];
+				// TODO: Use local time format? Americans and some others might not like ISO standard :)
+				strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &time);
+				return std::string(buf);
+			}
+		}
+		return "";
+	}
 
 	std::vector<Operation> Flush()
 	{
@@ -500,6 +541,7 @@ namespace SaveState
 				INFO_LOG(COMMON, "Saving state to %s", op.filename.c_str());
 				result = CChunkFileReader::Save(op.filename, REVISION, PPSSPP_GIT_VERSION, state);
 				if (result == CChunkFileReader::ERROR_NONE) {
+
 					osm.Show(s->T("Saved State"), 2.0);
 					callbackResult = true;
 				} else if (result == CChunkFileReader::ERROR_BROKEN_STATE) {
@@ -539,6 +581,12 @@ namespace SaveState
 				} else {
 					osm.Show(i18nLoadFailure, 2.0);
 					callbackResult = false;
+				}
+				break;
+
+			case SAVESTATE_SAVE_SCREENSHOT:
+				if (!TakeGameScreenshot(op.filename.c_str(), SCREENSHOT_JPG, SCREENSHOT_RENDER)) {
+					ERROR_LOG(COMMON, "Failed to take a screenshot for the savestate! %s", op.filename.c_str());
 				}
 				break;
 

@@ -25,6 +25,28 @@
 
 class Shader;
 
+struct ShaderID {
+	ShaderID() { d[0] = 0xFFFFFFFF; }
+	void clear() { d[0] = 0xFFFFFFFF; }
+	u32 d[2];
+	bool operator < (const ShaderID &other) const {
+		for (size_t i = 0; i < sizeof(d) / sizeof(u32); i++) {
+			if (d[i] < other.d[i])
+				return true;
+			if (d[i] > other.d[i])
+				return false;
+		}
+		return false;
+	}
+	bool operator == (const ShaderID &other) const {
+		for (size_t i = 0; i < sizeof(d) / sizeof(u32); i++) {
+			if (d[i] != other.d[i])
+				return false;
+		}
+		return true;
+	}
+};
+
 // Pre-fetched attrs and uniforms
 enum {
 	ATTR_POSITION = 0,
@@ -82,6 +104,7 @@ public:
 	// Fragment processing inputs
 	int u_alphacolorref;
 	int u_alphacolormask;
+	int u_testtex;
 	int u_fogcolor;
 	int u_fogcoef;
 
@@ -106,9 +129,7 @@ public:
 	int u_lightambient[4];  // attenuation
 };
 
-// Will reach 32 bits soon :P
-enum
-{
+enum {
 	DIRTY_PROJMATRIX = (1 << 0),
 	DIRTY_PROJTHROUGHMATRIX = (1 << 1),
 	DIRTY_FOGCOLOR	 = (1 << 2),
@@ -155,23 +176,23 @@ enum
 
 class Shader {
 public:
-	Shader(const char *code, uint32_t shaderType, bool useHWTransform);
+	Shader(const char *code, uint32_t shaderType, bool useHWTransform, const ShaderID &shaderID);
 	~Shader();
 	uint32_t shader;
 	const std::string &source() const { return source_; }
 
 	bool Failed() const { return failed_; }
 	bool UseHWTransform() const { return useHWTransform_; }
+	const ShaderID &ID() const { return id_; }
 
 private:
 	std::string source_;
+	ShaderID id_;
 	bool failed_;
 	bool useHWTransform_;
 };
 
-
-class ShaderManager
-{
+class ShaderManager {
 public:
 	ShaderManager();
 	~ShaderManager();
@@ -195,6 +216,7 @@ public:
 
 private:
 	void Clear();
+	static bool DebugAreShadersCompatibleForLinking(Shader *vs, Shader *fs);
 
 	struct LinkedShaderCacheEntry {
 		LinkedShaderCacheEntry(Shader *vs_, Shader *fs_, LinkedShader *ls_)
@@ -210,17 +232,17 @@ private:
 
 	bool lastVShaderSame_;
 
-	FragmentShaderID lastFSID_;
-	VertexShaderID lastVSID_;
+	ShaderID lastFSID_;
+	ShaderID lastVSID_;
 
 	LinkedShader *lastShader_;
 	u32 globalDirty_;
 	u32 shaderSwitchDirty_;
 	char *codeBuffer_;
 
-	typedef std::map<FragmentShaderID, Shader *> FSCache;
+	typedef std::map<ShaderID, Shader *> FSCache;
 	FSCache fsCache_;
 
-	typedef std::map<VertexShaderID, Shader *> VSCache;
+	typedef std::map<ShaderID, Shader *> VSCache;
 	VSCache vsCache_;
 };

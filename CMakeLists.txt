@@ -2,16 +2,32 @@
 cmake_minimum_required(VERSION 2.8.8)
 project(PPSSPP)
 enable_language(ASM)
+set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${CMAKE_SOURCE_DIR}/CMakeTests)
 
 add_definitions(-DPPSSPP)
 
-# Detect CPU from CMAKE configuration. Toolchains should set this up
-if(${CMAKE_SYSTEM_PROCESSOR} MATCHES "^arm")
-	set(ARM ON)
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+	set(_ARCH_64 1)
+	add_definitions(-D_ARCH_64=1)
+else()
+	set(_ARCH_32 1)
+	add_definitions(-D_ARCH_32=1)
 endif()
 
-if(${CMAKE_SYSTEM_PROCESSOR} MATCHES "^armv7")
-	set(ARMV7 ON)
+# Detect CPU from CMAKE configuration. Toolchains should set this up
+if(CMAKE_SYSTEM_PROCESSOR)
+	if(${CMAKE_SYSTEM_PROCESSOR} MATCHES "^arm")
+		set(ARM ON)
+		if(${CMAKE_SYSTEM_PROCESSOR} MATCHES "^armv7")
+			set(ARMV7 ON)
+		endif()
+	elseif(${CMAKE_SYSTEM_PROCESSOR} MATCHES "^x86" OR
+		${CMAKE_SYSTEM_PROCESSOR} MATCHES "^amd64" OR
+		${CMAKE_SYSTEM_PROCESSOR} MATCHES "i.86")
+		set(X86 ON)
+	elseif(${CMAKE_SYSTEM_PROCESSOR} MATCHES "^mips")
+		set(MIPS ON)
+	endif()
 endif()
 
 # Remove soon?
@@ -19,22 +35,18 @@ set(USE_FFMPEG ON)
 
 if(ARM OR SIMULATOR)
 	set(USING_EGL ON)
-	set(MOBILE_DEVICE ON)
-endif()
-if (NOT ARM) # Assume x86
-	set(X86 ON)
 endif()
 
-include(CheckIncludeFile)
-check_include_file(/opt/vc/include/bcm_host.h RPI)
-if(RPI)
-	set(MOBILE_DEVICE OFF)
+if(EXISTS "/opt/vc/include/bcm_host.h")
+	message(STATUS "RaspberryPI VC Found")
+	set(RPI ON)
 endif()
 
-if(USING_EGL)
-	# Default to GLES2 but could be GL.
-	set(USING_GLES2 ON)
+if(BB)
+	set(ARMV7 ON)
+	set(USING_FBDEV ON)
 endif()
+
 
 if(${CMAKE_SYSTEM_NAME} MATCHES "Linux")
 	set(LINUX ON)
@@ -46,7 +58,7 @@ if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
 endif()
 
 if (X86 AND NOT MIPS)
-	if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+	if(_ARCH_64)
 		add_definitions(-D_M_X64)
 	else()
 		add_definitions(-D_M_IX86)
@@ -73,6 +85,7 @@ option(ANDROID "Set to ON if targeting an Android device" ${ANDROID})
 option(BLACKBERRY "Set to ON if targeting a Blackberry device" ${BLACKBERRY})
 option(IOS "Set to ON if targeting an iOS device" ${IOS})
 option(MAEMO "Set to ON if targeting a Maemo (N900) device" ${MAEMO})
+option(BB "Set to ON if targeting a Beaglebone/Beaglebone Black device" ${BB})
 # :: Environments
 option(USING_EGL "Set to ON if target environment uses EGL" ${USING_EGL})
 option(USING_FBDEV "Set to ON if target environment uses fbdev (eg. Pandora)" ${USING_FBDEV})
@@ -85,6 +98,7 @@ option(UNITTEST "Set to ON to generate the unittest target" ${UNITTEST})
 option(SIMULATOR "Set to ON when targeting an x86 simulator of an ARM platform" ${SIMULATOR})
 # :: Options
 option(USE_FFMPEG "Build with FFMPEG support" ${USE_FFMPEG})
+option(USE_SYSTEM_FFMPEG "Dynamically link against system FFMPEG" ${USE_SYSTEM_FFMPEG})
 
 if(ANDROID OR BLACKBERRY OR IOS)
 	if (NOT CMAKE_TOOLCHAIN_FILE)
@@ -100,6 +114,8 @@ if(ANDROID OR BLACKBERRY OR IOS)
 			"Re-run ${CMAKE_COMMAND} with:\n"
 			"\"-DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}\"")
 	endif()
+	set(MOBILE_DEVICE ON)
+	set(USING_GLES2 ON)
 endif()
 
 if(ANDROID)
@@ -109,6 +125,8 @@ else()
 	set(CoreLibName Core)
 	set(CoreLinkType STATIC)
 endif()
+
+include_directories(native)
 
 if(RPI)
 	include_directories(/opt/vc/include /opt/vc/include/interface/vcos/pthreads)
@@ -126,7 +144,7 @@ if(MAEMO)
 endif()
 
 if (NOT BLACKBERRY AND NOT ANDROID AND NOT IOS)
-	include(FindSDL)
+	include(FindSDL2)
 endif()
 include(FindThreads)
 
@@ -182,8 +200,10 @@ if(ARMV7)
 	message("Building for ARMv7, ${CMAKE_BUILD_TYPE}")
 elseif(ARM)
 	message("Building for ARMv6, ${CMAKE_BUILD_TYPE}")
-elseif(MIPS)
+elseif(MIPS AND X86)
 	message("Building for MIPS in x86 mode, ${CMAKE_BUILD_TYPE}")
+elseif(MIPS)
+	message("Buildings for MIPS, ${CMAKE_BUILD_TYPE}")
 elseif(X86)
 	message("Building for x86, ${CMAKE_BUILD_TYPE}")
 else()
@@ -219,7 +239,8 @@ if(NOT MSVC)
 
 	if(IOS)
 		add_definitions(-DGL_ETC1_RGB8_OES=0)
-		set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libstdc++")
+		set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++ -U__STRICT_ANSI__")
+		set(CMAKE_XCODE_ATTRIBUTE_CLANG_CXX_LIBRARY "libc++")
 		# armv7s (without resorting to FastMemory) is still a work in progress
 		# comment out the next line to enable default/"standard" architectures (which is a fat armv7/armv7s binary)
 		set(CMAKE_OSX_ARCHITECTURES "armv7")
@@ -232,7 +253,12 @@ if(NOT MSVC)
 		if (NOT CMAKE_C_COMPILER_ID STREQUAL "Intel" AND NOT CMAKE_C_COMPILER_ID STREQUAL "Clang")
 			add_definitions(-Wno-psabi)
 		endif()
-		add_definitions(-D_XOPEN_SOURCE=600 -D_XOPEN_SOURCE_EXTENDED -D__BSD_VISIBLE=1)
+		if (BLACKBERRY)
+			add_definitions(-D_XOPEN_SOURCE=600)
+		else()
+			add_definitions(-D_XOPEN_SOURCE=700)
+		endif()
+		add_definitions(-D_XOPEN_SOURCE_EXTENDED -D__BSD_VISIBLE=1)
 		add_definitions(-D_LARGEFILE64_SOURCE=1 -D_FILE_OFFSET_BITS=64)
 	endif()
 	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
@@ -272,15 +298,12 @@ set(CommonExtra)
 if(ARM)
 	set(CommonExtra ${CommonExtra}
 		Common/ArmCPUDetect.cpp
-		Common/ArmEmitter.h
-		Common/ArmEmitter.cpp
-		Common/ArmThunk.cpp)
+		Common/ArmThunk.cpp
+		Common/ColorConvNEON.cpp)
 elseif(X86)
 	set(CommonExtra ${CommonExtra}
 		Common/ABI.cpp
 		Common/ABI.h
-		Common/ArmEmitter.h
-		Common/ArmEmitter.cpp
 		Common/CPUDetect.cpp
 		Common/CPUDetect.h
 		Common/Thunk.cpp
@@ -289,7 +312,31 @@ elseif(X86)
 		Common/x64Analyzer.h
 		Common/x64Emitter.cpp
 		Common/x64Emitter.h)
+elseif(MIPS)
+	set(CommonExtra ${CommonExtra}
+		Common/MipsCPUDetect.cpp
+		Common/MipsEmitter.cpp
+		Common/MipsEmitter.h)
+else()
+	set(CommonExtra ${CommonExtra}
+		Common/FakeCPUDetect.cpp
+		Common/FakeEmitter.h)
 endif()
+
+if(UNITTEST)
+set(CommonExtra ${CommonExtra}
+		Common/Arm64Emitter.h
+		Common/Arm64Emitter.cpp
+		Common/ArmEmitter.h
+		Common/ArmEmitter.cpp
+		Core/Util/DisArm64.cpp)
+else()
+#Blackberry appears to depend on this being here, should clean it up.
+set(CommonExtra ${CommonExtra}
+		Common/ArmEmitter.h
+		Common/ArmEmitter.cpp)
+endif()
+
 if(WIN32)
 	set(CommonExtra ${CommonExtra}
 		Common/stdafx.cpp
@@ -298,6 +345,8 @@ endif()
 
 add_library(Common STATIC
 	${CommonExtra}
+	Common/ColorConv.cpp
+	Common/ColorConv.h
 	Common/ChunkFile.cpp
 	Common/ChunkFile.h
 	Common/ConsoleListener.cpp
@@ -306,6 +355,8 @@ add_library(Common STATIC
 	Common/Crypto/md5.h
 	Common/Crypto/sha1.cpp
 	Common/Crypto/sha1.h
+	Common/Crypto/sha256.cpp
+	Common/Crypto/sha256.h
 	Common/FileUtil.cpp
 	Common/FileUtil.h
 	Common/KeyMap.cpp
@@ -346,16 +397,8 @@ if(NOT USING_GLES2)
 	set(GLEW_LIBRARIES glew)
 endif()
 
-add_library(snappy STATIC
-	ext/snappy/snappy-c.cpp
-	ext/snappy/snappy-internal.h
-	ext/snappy/snappy-sinksource.h
-	ext/snappy/snappy-stubs-internal.h
-	ext/snappy/snappy-stubs-public.h
-	ext/snappy/snappy.cpp
-	ext/snappy/snappy.h
-)
-include_directories(ext/snappy)
+add_subdirectory(ext/snappy)
+add_subdirectory(ext/udis86)
 
 add_library(vjson STATIC
 	native/ext/vjson/json.cpp
@@ -374,93 +417,105 @@ add_library(stb_vorbis STATIC
 	native/ext/stb_vorbis/stb_vorbis.h)
 include_directories(native/ext/stb_vorbis)
 
-if(USE_FFMPEG AND NOT DEFINED FFMPEG_BUILDDIR)
-	if(ANDROID)
-		if(ARMV7)
-			set(PLATFORM_ARCH "android/armv7")
-		elseif(ARM)
-			set(PLATFORM_ARCH "android/arm")
-		elseif(X86)
-			set(PLATFORM_ARCH "android/x86")
-		endif()
-	elseif(BLACKBERRY)
-		set(PLATFORM_ARCH "blackberry/armv7")
-	elseif(IOS)
-		set(PLATFORM_ARCH "ios/universal")
-	elseif(MACOSX)
-		set(PLATFORM_ARCH "macosx/x86_64")
-	elseif(LINUX)
-		if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-			set(PLATFORM_ARCH "linux/x86_64")
-		else()
-			set(PLATFORM_ARCH "linux/x86")
-		endif()
-	endif()
-	# Using static libraries
-	if (DEFINED PLATFORM_ARCH)
-		include_directories(ffmpeg/${PLATFORM_ARCH}/include)
-		link_directories(ffmpeg/${PLATFORM_ARCH}/lib)
-		set(FFMPEG_LIBRARIES libavformat.a libavcodec.a libavutil.a libswresample.a libswscale.a)
-	else()
-		# Manual definition of system library locations by the user.
-		if (DEFINED FFMPEG_INCLUDE_PATH)
-			include_directories(ffmpeg ${FFMPEG_INCLUDE_PATH})
-		endif()
-		if (DEFINED AVFORMAT_PATH)
-			add_library(libavformat STATIC IMPORTED)
-			set_target_properties(libavformat PROPERTIES IMPORTED_LOCATION ${AVFORMAT_PATH})
-			SET (FFMPEG_LIBRARIES ${FFMPEG_LIBRARIES} libavformat)
-		endif()
-		if (DEFINED AVCODEC_PATH)
-			add_library(libavcodec STATIC IMPORTED)
-			set_target_properties(libavcodec PROPERTIES IMPORTED_LOCATION ${AVCODEC_PATH})
-			SET (FFMPEG_LIBRARIES ${FFMPEG_LIBRARIES} libavcodec)
-		endif()
-		if (DEFINED AVUTIL_PATH)
-			add_library(libavutil STATIC IMPORTED)
-			set_target_properties(libavutil PROPERTIES IMPORTED_LOCATION ${AVUTIL_PATH})
-			SET (FFMPEG_LIBRARIES ${FFMPEG_LIBRARIES} libavutil)
-		endif()
-		if (DEFINED SWRESAMPLE_PATH)
-			add_library(libswresample STATIC IMPORTED)
-			set_target_properties(libswresample PROPERTIES IMPORTED_LOCATION ${SWRESAMPLE_PATH})
-			SET (FFMPEG_LIBRARIES ${FFMPEG_LIBRARIES} libswresample)
-		endif()
-		if (DEFINED SWSCALE_PATH)
-			add_library(libswscale STATIC IMPORTED)
-			set_target_properties(libswscale PROPERTIES IMPORTED_LOCATION ${SWSCALE_PATH})
-			SET (FFMPEG_LIBRARIES ${FFMPEG_LIBRARIES} libswscale)
-		endif()
-	endif(DEFINED PLATFORM_ARCH)
-endif(USE_FFMPEG AND NOT DEFINED FFMPEG_BUILDDIR)
-
 if(USE_FFMPEG)
-	# Using shared libraries
-	if(DEFINED FFMPEG_BUILDDIR)
-		include_directories(ffmpeg ${FFMPEG_BUILDDIR})
-
-		add_library(libavformat STATIC IMPORTED)
-		set_target_properties(libavformat PROPERTIES IMPORTED_LOCATION ${FFMPEG_BUILDDIR}/libavformat/libavformat.a)
-		add_library(libavcodec STATIC IMPORTED)
-		set_target_properties(libavcodec PROPERTIES IMPORTED_LOCATION ${FFMPEG_BUILDDIR}/libavcodec/libavcodec.a)
-		add_library(libavutil STATIC IMPORTED)
-		set_target_properties(libavutil PROPERTIES IMPORTED_LOCATION ${FFMPEG_BUILDDIR}/libavutil/libavutil.a)
-		add_library(libswresample STATIC IMPORTED)
-		set_target_properties(libswresample PROPERTIES IMPORTED_LOCATION ${FFMPEG_BUILDDIR}/libswresample/libswresample.a)
-		add_library(libswscale STATIC IMPORTED)
-		set_target_properties(libswscale PROPERTIES IMPORTED_LOCATION ${FFMPEG_BUILDDIR}/libswscale/libswscale.a)
-
-		SET (FFMPEG_LIBRARIES
-			libavformat
-			libavcodec
-			libavutil
-			libswresample
-			libswscale
-		)
+	if(USE_SYSTEM_FFMPEG)
+		include(FindFFMPEG)
+	else()
+		set(FFMPEG_FOUND OFF)
 	endif()
+	if(NOT FFMPEG_FOUND)
+		if(NOT DEFINED FFMPEG_BUILDDIR)
+			if(ANDROID)
+				if(ARMV7)
+					set(PLATFORM_ARCH "android/armv7")
+				elseif(ARM)
+					set(PLATFORM_ARCH "android/arm")
+				elseif(X86)
+					set(PLATFORM_ARCH "android/x86")
+				endif()
+			elseif(BLACKBERRY)
+				set(PLATFORM_ARCH "blackberry/armv7")
+			elseif(IOS)
+				set(PLATFORM_ARCH "ios/universal")
+			elseif(MACOSX)
+				set(PLATFORM_ARCH "macosx/x86_64")
+			elseif(LINUX)
+				if(ARMV7)
+					set(PLATFORM_ARCH "linux/armv7")
+				elseif(ARM)
+					set(PLATFORM_ARCH "linux/arm")
+				elseif(MIPS)
+					set(PLATFORM_ARCH "linux/mips32")
+				elseif(CMAKE_SIZEOF_VOID_P EQUAL 8)
+					set(PLATFORM_ARCH "linux/x86_64")
+				else()
+					set(PLATFORM_ARCH "linux/x86")
+				endif()
+			endif()
+			# Using static libraries
+			if (DEFINED PLATFORM_ARCH)
+				include_directories(ffmpeg/${PLATFORM_ARCH}/include)
+				link_directories(ffmpeg/${PLATFORM_ARCH}/lib)
+				set(FFMPEG_LIBRARIES libavformat.a libavcodec.a libavutil.a libswresample.a libswscale.a)
+			else()
+				# Manual definition of system library locations by the user.
+				if (DEFINED FFMPEG_INCLUDE_PATH)
+					include_directories(ffmpeg ${FFMPEG_INCLUDE_PATH})
+				endif()
+				if (DEFINED AVFORMAT_PATH)
+					add_library(libavformat STATIC IMPORTED)
+					set_target_properties(libavformat PROPERTIES IMPORTED_LOCATION ${AVFORMAT_PATH})
+					SET (FFMPEG_LIBRARIES ${FFMPEG_LIBRARIES} libavformat)
+				endif()
+				if (DEFINED AVCODEC_PATH)
+					add_library(libavcodec STATIC IMPORTED)
+					set_target_properties(libavcodec PROPERTIES IMPORTED_LOCATION ${AVCODEC_PATH})
+					SET (FFMPEG_LIBRARIES ${FFMPEG_LIBRARIES} libavcodec)
+				endif()
+				if (DEFINED AVUTIL_PATH)
+					add_library(libavutil STATIC IMPORTED)
+					set_target_properties(libavutil PROPERTIES IMPORTED_LOCATION ${AVUTIL_PATH})
+					SET (FFMPEG_LIBRARIES ${FFMPEG_LIBRARIES} libavutil)
+				endif()
+				if (DEFINED SWRESAMPLE_PATH)
+					add_library(libswresample STATIC IMPORTED)
+					set_target_properties(libswresample PROPERTIES IMPORTED_LOCATION ${SWRESAMPLE_PATH})
+					SET (FFMPEG_LIBRARIES ${FFMPEG_LIBRARIES} libswresample)
+				endif()
+				if (DEFINED SWSCALE_PATH)
+					add_library(libswscale STATIC IMPORTED)
+					set_target_properties(libswscale PROPERTIES IMPORTED_LOCATION ${SWSCALE_PATH})
+					SET (FFMPEG_LIBRARIES ${FFMPEG_LIBRARIES} libswscale)
+				endif()
+			endif(DEFINED PLATFORM_ARCH)
+		else(NOT DEFINED FFMPEG_BUILDDIR)
+			# Using shared libraries
+			include_directories(ffmpeg ${FFMPEG_BUILDDIR})
 
-	if(APPLE OR BLACKBERRY)
-		set(FFMPEG_LIBRARIES ${FFMPEG_LIBRARIES} iconv)
+			add_library(libavformat STATIC IMPORTED)
+			set_target_properties(libavformat PROPERTIES IMPORTED_LOCATION ${FFMPEG_BUILDDIR}/libavformat/libavformat.a)
+			add_library(libavcodec STATIC IMPORTED)
+			set_target_properties(libavcodec PROPERTIES IMPORTED_LOCATION ${FFMPEG_BUILDDIR}/libavcodec/libavcodec.a)
+			add_library(libavutil STATIC IMPORTED)
+			set_target_properties(libavutil PROPERTIES IMPORTED_LOCATION ${FFMPEG_BUILDDIR}/libavutil/libavutil.a)
+			add_library(libswresample STATIC IMPORTED)
+			set_target_properties(libswresample PROPERTIES IMPORTED_LOCATION ${FFMPEG_BUILDDIR}/libswresample/libswresample.a)
+			add_library(libswscale STATIC IMPORTED)
+			set_target_properties(libswscale PROPERTIES IMPORTED_LOCATION ${FFMPEG_BUILDDIR}/libswscale/libswscale.a)
+
+			SET (FFMPEG_LIBRARIES
+				libavformat
+				libavcodec
+				libavutil
+				libswresample
+				libswscale
+			)
+		endif(NOT DEFINED FFMPEG_BUILDDIR)
+	endif(NOT FFMPEG_FOUND)
+
+	find_library(ICONV_LIBRARY NAMES iconv)
+	if (ICONV_LIBRARY)
+		set(FFMPEG_LIBRARIES ${FFMPEG_LIBRARIES} ${ICONV_LIBRARY})
 	endif()
 
 	if(APPLE)
@@ -470,15 +525,25 @@ if(USE_FFMPEG)
 		endif()
 	endif(APPLE)
 
-	set(LinkCommon ${LinkCommon} ${FFMPEG_LIBRARIES})
+	if(FFMPEG_FOUND)
+		set(nativeExtraLibs ${nativeExtraLibs} ${FFMPEG_LIBRARIES})
+	else()
+		set(LinkCommon ${LinkCommon} ${FFMPEG_LIBRARIES})
+	endif()
+	target_link_libraries(Common ${FFMPEG_LIBRARIES})
 	add_definitions(-DUSE_FFMPEG)
 endif(USE_FFMPEG)
 
 # Modification to show where we are pulling the ffmpeg libraries from.
 if(USE_FFMPEG AND DEFINED FFMPEG_LIBRARIES)
-	target_link_libraries(Common ${FFMPEG_LIBRARIES})
 	message(STATUS "FFMPEG library locations:")
-	if(DEFINED PLATFORM_ARCH)
+	if(FFMPEG_FOUND)
+		message(STATUS "libavcodec location: ${FFMPEG_avcodec_LIBRARY}")
+		message(STATUS "libavformat location: ${FFMPEG_avformat_LIBRARY}")
+		message(STATUS "libavutil location: ${FFMPEG_avutil_LIBRARY}")
+		message(STATUS "libswresample location: ${FFMPEG_swresample_LIBRARY}")
+		message(STATUS "libswscale location: ${FFMPEG_swscale_LIBRARY}")
+	elseif(DEFINED PLATFORM_ARCH)
 		set(TEMP ${CMAKE_SOURCE_DIR}/ffmpeg/${PLATFORM_ARCH}/lib)
 		message(STATUS "libavcodec location: ${TEMP}/libavcodec.a")
 		message(STATUS "libavformat location: ${TEMP}/libavformat.a")
@@ -496,7 +561,7 @@ if(USE_FFMPEG AND DEFINED FFMPEG_LIBRARIES)
 		message(STATUS "libswresample location: ${TEMP}")
 		get_target_property(TEMP libswscale IMPORTED_LOCATION)
 		message(STATUS "libswscale location: ${TEMP}")
-	endif(DEFINED PLATFORM_ARCH)
+	endif()
 else()
 	message(STATUS "ERROR: No FFMPEG library locations")
 endif()
@@ -553,6 +618,7 @@ include_directories(ext/cityhash)
 if (NOT MSVC)
 	# These can be fast even for debug.
 	set_target_properties(snappy PROPERTIES COMPILE_FLAGS "-O3")
+	set_target_properties(udis86 PROPERTIES COMPILE_FLAGS "-O3")
 	set_target_properties(cityhash PROPERTIES COMPILE_FLAGS "-O3")
 	if(NOT ZLIB_FOUND)
 		set_target_properties(zlib PROPERTIES COMPILE_FLAGS "-O3")
@@ -659,12 +725,18 @@ else()
 	set(PNG_LIBRARY png17)
 	include_directories(native/ext)
 endif()
-	
+
 set(nativeExtra)
 set(nativeExtraLibs)
 
 if(ARMV7)
-	set (CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -march=armv7-a -mfpu=neon -mcpu=cortex-a9")
+	if(BB)
+		set (CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -march=armv7-a -mfpu=neon -mcpu=cortex-a8")
+	else()
+		set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=armv7-a -mfpu=neon -mcpu=cortex-a9")
+		set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=armv7-a -mfpu=neon -mcpu=cortex-a9")
+		set (CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -march=armv7-a -mfpu=neon -mcpu=cortex-a9")
+	endif()
 	set(nativeExtra ${nativeExtra}
     native/math/fast/fast_matrix_neon.S)
 endif()
@@ -689,7 +761,7 @@ if(ANDROID)
 elseif(IOS)
 	set(nativeExtra ${nativeExtra}
 		ios/main.mm
-		ios/AppDelegate.m
+		ios/AppDelegate.mm
 		ios/AppDelegate.h
 		ios/ViewController.mm
 		ios/ViewController.h
@@ -703,7 +775,7 @@ elseif(IOS)
 		set(nativeExtraLibs ${nativeExtraLibs} "-weak_framework GameController")
 	endif()
 
-	set_source_files_properties(ios/AppDelegate.m PROPERTIES COMPILE_FLAGS -fobjc-arc)
+	set_source_files_properties(ios/AppDelegate.mm PROPERTIES COMPILE_FLAGS -fobjc-arc)
 	set_source_files_properties(ios/ViewController.mm PROPERTIES COMPILE_FLAGS -fobjc-arc)
 
 	set(TargetBin PPSSPP)
@@ -728,15 +800,16 @@ elseif(BLACKBERRY)
 	set(nativeExtra ${nativeExtra} native/base/BlackberryMain.cpp native/base/BlackberryDisplay.cpp)
 	set(nativeExtraLibs ${nativeExtraLibs} OpenAL bps screen socket EGL)
 	set(TargetBin PPSSPPBlackberry)
-elseif(SDL_FOUND)
+elseif(SDL2_FOUND)
 	set(TargetBin PPSSPPSDL)
 	# Require SDL
-	include_directories(${SDL_INCLUDE_DIR})
-	set(nativeExtra ${nativeExtra} 
+	include_directories(${SDL2_INCLUDE_DIR})
+	add_definitions(-DSDL)
+	set(nativeExtra ${nativeExtra}
 		SDL/SDLJoystick.h
 		SDL/SDLJoystick.cpp
 		native/base/PCMain.cpp)
-	set(nativeExtraLibs ${nativeExtraLibs} ${SDL_LIBRARY})
+	set(nativeExtraLibs ${nativeExtraLibs} ${SDL2_LIBRARY})
 	if(APPLE)
 		set(nativeExtra ${nativeExtra} SDL/SDLMain.h SDL/SDLMain.mm)
 		set(nativeExtraLibs ${nativeExtraLibs} ${COCOA_LIBRARY})
@@ -745,18 +818,19 @@ elseif(SDL_FOUND)
 	endif()
 	set(TargetBin PPSSPPSDL)
 else()
-	message(FATAL_ERROR "Could not find SDL. Failing.")
+	message(FATAL_ERROR "Could not find SDL2. Failing.")
 endif()
 
 set(NativeAppSource
+	android/jni/TestRunner.cpp
 	UI/NativeApp.cpp
 	UI/BackgroundAudio.cpp
 	UI/DevScreens.cpp
 	UI/EmuScreen.cpp
-	android/jni/TestRunner.cpp
 	UI/GameInfoCache.cpp
 	UI/MainScreen.cpp
 	UI/MiscScreens.cpp
+	UI/PauseScreen.cpp
 	UI/GameScreen.cpp
 	UI/GameSettingsScreen.cpp
 	UI/TiltAnalogSettingsScreen.cpp
@@ -764,9 +838,10 @@ set(NativeAppSource
 	UI/TouchControlLayoutScreen.cpp
 	UI/TouchControlVisibilityScreen.cpp
 	UI/GamepadEmu.cpp
-	UI/UIShader.cpp
 	UI/OnScreenDisplay.cpp
 	UI/ControlMappingScreen.cpp
+	UI/ReportScreen.cpp
+	UI/SavedataScreen.cpp
 	UI/Store.cpp
 	UI/CwCheatScreen.cpp
 	UI/InstallZipScreen.cpp
@@ -899,6 +974,9 @@ add_library(native STATIC
 	native/net/url.h
 	native/profiler/profiler.cpp
 	native/profiler/profiler.h
+	native/thin3d/thin3d.cpp
+	native/thin3d/thin3d.h
+	native/thin3d/thin3d_gl.cpp
 	native/thread/prioritizedworkqueue.cpp
 	native/thread/prioritizedworkqueue.h
 	native/thread/threadutil.cpp
@@ -944,7 +1022,7 @@ if (LINUX AND NOT ANDROID)
 	SET(RT_LIB rt)
 endif()
 
-target_link_libraries(native ${LIBZIP_LIBRARY} ${PNG_LIBRARY} rg_etc1 vjson stb_vorbis snappy ${RT_LIB} ${GLEW_LIBRARIES})
+target_link_libraries(native ${LIBZIP_LIBRARY} ${PNG_LIBRARY} rg_etc1 vjson stb_vorbis snappy udis86 ${RT_LIB} ${GLEW_LIBRARIES})
 
 if(ANDROID)
 	target_link_libraries(native log EGL)
@@ -965,6 +1043,15 @@ add_library(kirk STATIC
 	ext/libkirk/kirk_engine.c
 	ext/libkirk/kirk_engine.h)
 include_directories(ext/libkirk)
+
+add_library(sfmt19937 STATIC
+	ext/sfmt19937/SFMT.c
+	ext/sfmt19937/SFMT.h
+	ext/sfmt19937/SFMT-common.h
+	ext/sfmt19937/SFMT-params.h
+	ext/sfmt19937/SFMT-params19937.h
+)
+include_directories(ext/sfmt19937)
 
 add_library(xbrz STATIC
 	ext/xbrz/xbrz.cpp
@@ -990,6 +1077,7 @@ if(ARM)
 		Core/MIPS/ARM/ArmCompLoadStore.cpp
 		Core/MIPS/ARM/ArmCompVFPU.cpp
 		Core/MIPS/ARM/ArmCompVFPUNEON.cpp
+		Core/MIPS/ARM/ArmCompVFPUNEONUtil.cpp
 		Core/MIPS/ARM/ArmCompReplace.cpp
 		Core/MIPS/ARM/ArmJit.cpp
 		Core/MIPS/ARM/ArmJit.h
@@ -997,9 +1085,26 @@ if(ARM)
 		Core/MIPS/ARM/ArmRegCache.h
 		Core/MIPS/ARM/ArmRegCacheFPU.cpp
 		Core/MIPS/ARM/ArmRegCacheFPU.h
-		GPU/GLES/VertexDecoderArm.cpp
-		GPU/GLES/VertexDecoder.h
+		GPU/Common/VertexDecoderArm.cpp
 		ext/disarm.cpp)
+elseif(ARM64)
+  set(CoreExtra ${CoreExtra}
+		Core/MIPS/ARM64/Arm64Asm.cpp
+		Core/MIPS/ARM64/Arm64Asm.h
+		Core/MIPS/ARM64/Arm64CompALU.cpp
+		Core/MIPS/ARM64/Arm64CompBranch.cpp
+		Core/MIPS/ARM64/Arm64CompFPU.cpp
+		Core/MIPS/ARM64/Arm64CompLoadStore.cpp
+		Core/MIPS/ARM64/Arm64CompVFPU.cpp
+		Core/MIPS/ARM64/Arm64CompReplace.cpp
+		Core/MIPS/ARM64/Arm64Jit.cpp
+		Core/MIPS/ARM64/Arm64Jit.h
+		Core/MIPS/ARM64/Arm64RegCache.cpp
+		Core/MIPS/ARM64/Arm64RegCache.h
+		Core/MIPS/ARM64/Arm64RegCacheFPU.cpp
+		Core/MIPS/ARM64/Arm64RegCacheFPU.h
+		GPU/Common/VertexDecoderArm.cpp
+		Core/Util/DisArm64.cpp)
 elseif(X86)
 	set(CoreExtra ${CoreExtra}
 		Core/MIPS/x86/Asm.cpp
@@ -1018,9 +1123,24 @@ elseif(X86)
 		Core/MIPS/x86/RegCache.h
 		Core/MIPS/x86/RegCacheFPU.cpp
 		Core/MIPS/x86/RegCacheFPU.h
-		GPU/GLES/VertexDecoderX86.cpp
-		GPU/GLES/VertexDecoder.h
+		GPU/Common/VertexDecoderX86.cpp
 		ext/disarm.cpp)
+elseif(MIPS)
+	set(CoreExtra ${CoreExtra}
+		Core/MIPS/MIPS/MipsJit.cpp
+		Core/MIPS/MIPS/MipsJit.h
+		GPU/Common/VertexDecoderFake.cpp
+		ext/disarm.cpp)
+else()
+	set(CoreExtra ${CoreExtra}
+		Core/MIPS/fake/FakeJit.cpp
+		Core/MIPS/fake/FakeJit.h
+		GPU/Common/VertexDecoderFake.cpp
+		ext/disarm.cpp)
+endif()
+
+if(ARMV7)
+	set(CORE_NEON Core/Util/AudioFormatNEON.cpp Core/Util/AudioFormatNEON.h)
 endif()
 
 # 'ppsspp_jni' on ANDROID, 'Core' everywhere else
@@ -1100,11 +1220,15 @@ add_library(${CoreLibName} ${CoreLinkType}
 	Core/HLE/KernelWaitHelpers.h
 	Core/HLE/__sceAudio.cpp
 	Core/HLE/__sceAudio.h
+	Core/HLE/sceAdler.cpp
+	Core/HLE/sceAdler.h
 	Core/HLE/sceAtrac.cpp
 	Core/HLE/sceAtrac.h
 	Core/HLE/sceAudio.cpp
 	Core/HLE/sceAudiocodec.cpp
 	Core/HLE/sceAudiocodec.h
+	Core/HLE/sceAudioRouting.cpp
+	Core/HLE/sceAudioRouting.h
 	Core/HLE/sceAudio.h
 	Core/HLE/sceCcc.h
 	Core/HLE/sceCcc.cpp
@@ -1118,6 +1242,8 @@ add_library(${CoreLibName} ${CoreLinkType}
 	Core/HLE/sceDisplay.h
 	Core/HLE/sceDmac.cpp
 	Core/HLE/sceDmac.h
+	Core/HLE/sceG729.cpp
+	Core/HLE/sceG729.h
 	Core/HLE/sceGameUpdate.cpp
 	Core/HLE/sceGameUpdate.h
 	Core/HLE/sceGe.cpp
@@ -1170,6 +1296,8 @@ add_library(${CoreLibName} ${CoreLinkType}
 	Core/HLE/sceNetAdhoc.h
 	Core/HLE/proAdhoc.h
 	Core/HLE/proAdhoc.cpp
+	Core/HLE/proAdhocServer.h
+	Core/HLE/proAdhocServer.cpp
 	Core/HLE/sceOpenPSID.cpp
 	Core/HLE/sceOpenPSID.h
 	Core/HLE/sceP3da.cpp
@@ -1194,12 +1322,18 @@ add_library(${CoreLibName} ${CoreLinkType}
 	Core/HLE/sceRtc.h
 	Core/HLE/sceSas.cpp
 	Core/HLE/sceSas.h
+	Core/HLE/sceSfmt19937.cpp
+	Core/HLE/sceSfmt19937.h
+	Core/HLE/sceSha256.cpp
+	Core/HLE/sceSha256.h
 	Core/HLE/sceSsl.cpp
 	Core/HLE/sceSsl.h
 	Core/HLE/sceUmd.cpp
 	Core/HLE/sceUmd.h
 	Core/HLE/sceUsb.cpp
 	Core/HLE/sceUsb.h
+	Core/HLE/sceUsbGps.cpp
+	Core/HLE/sceUsbGps.h
 	Core/HLE/sceUtility.cpp
 	Core/HLE/sceUtility.h
 	Core/HLE/sceVaudio.cpp
@@ -1222,14 +1356,19 @@ add_library(${CoreLibName} ${CoreLinkType}
 	Core/HW/MemoryStick.h
 	Core/HW/SasAudio.cpp
 	Core/HW/SasAudio.h
+	Core/HW/StereoResampler.cpp
+	Core/HW/StereoResampler.h
 	Core/Host.cpp
 	Core/Host.h
 	Core/Loaders.cpp
 	Core/Loaders.h
 	Core/MIPS/JitCommon/JitCommon.cpp
 	Core/MIPS/JitCommon/JitCommon.h
+	Core/MIPS/JitCommon/NativeJit.h
 	Core/MIPS/JitCommon/JitBlockCache.cpp
 	Core/MIPS/JitCommon/JitBlockCache.h
+	Core/MIPS/JitCommon/JitState.cpp
+	Core/MIPS/JitCommon/JitState.h
 	Core/MIPS/MIPS.cpp
 	Core/MIPS/MIPS.h
 	Core/MIPS/MIPSAnalyst.cpp
@@ -1252,23 +1391,24 @@ add_library(${CoreLibName} ${CoreLinkType}
 	Core/MIPS/MIPSTables.h
 	Core/MIPS/MIPSVFPUUtils.cpp
 	Core/MIPS/MIPSVFPUUtils.h
-	Core/MIPS/MIPSAsmTables.cpp
-	Core/MIPS/MIPSAsmTables.h
 	Core/MIPS/MIPSAsm.cpp
 	Core/MIPS/MIPSAsm.h
 	Core/MemMap.cpp
 	Core/MemMap.h
 	Core/MemMapFunctions.cpp
+	Core/MemMapHelpers.h
 	Core/PSPLoaders.cpp
 	Core/PSPLoaders.h
-	Core/PSPMixer.cpp
-	Core/PSPMixer.h
 	Core/Reporting.cpp
 	Core/Reporting.h
 	Core/SaveState.cpp
 	Core/SaveState.h
+	Core/Screenshot.cpp
+	Core/Screenshot.h
 	Core/System.cpp
 	Core/System.h
+	Core/Util/AudioFormat.cpp
+	Core/Util/AudioFormat.h
 	Core/Util/GameManager.cpp
 	Core/Util/GameManager.h
 	Core/Util/BlockAllocator.cpp
@@ -1277,10 +1417,11 @@ add_library(${CoreLibName} ${CoreLinkType}
 	Core/Util/PPGeDraw.h
 	Core/Util/ppge_atlas.cpp
 	Core/Util/ppge_atlas.h
+	${CORE_NEON}
 	$<TARGET_OBJECTS:GPU>
 	Globals.h
 	git-version.cpp)
-target_link_libraries(${CoreLibName} Common native kirk cityhash xbrz xxhash
+target_link_libraries(${CoreLibName} Common native kirk cityhash sfmt19937 xbrz xxhash
 	${CoreExtraLibs} ${GLEW_LIBRARIES} ${OPENGL_LIBRARIES} ${X11_LIBRARIES} ${CMAKE_DL_LIBS})
 setup_target_project(${CoreLibName} Core)
 
@@ -1299,7 +1440,17 @@ if(ARMV7)
 	set(GPU_NEON GPU/Common/TextureDecoderNEON.cpp)
 endif()
 add_library(GPU OBJECT
+	GPU/Common/DepalettizeShaderCommon.cpp
+	GPU/Common/DepalettizeShaderCommon.h
+	GPU/Common/FramebufferCommon.cpp
+	GPU/Common/FramebufferCommon.h
 	GPU/Common/GPUDebugInterface.h
+	GPU/Common/DrawEngineCommon.cpp
+	GPU/Common/DrawEngineCommon.h
+	GPU/Common/SplineCommon.cpp
+	GPU/Common/SplineCommon.h
+	GPU/Common/SoftwareTransformCommon.cpp
+	GPU/Common/SoftwareTransformCommon.h
 	GPU/Common/VertexDecoderCommon.cpp
 	GPU/Common/VertexDecoderCommon.h
 	GPU/Common/TransformCommon.cpp
@@ -1308,6 +1459,10 @@ add_library(GPU OBJECT
 	GPU/Common/IndexGenerator.h
 	GPU/Common/TextureDecoder.cpp
 	GPU/Common/TextureDecoder.h
+	GPU/Common/TextureCacheCommon.cpp
+	GPU/Common/TextureCacheCommon.h
+	GPU/Common/TextureScalerCommon.cpp
+	GPU/Common/TextureScalerCommon.h
 	${GPU_NEON}
 	GPU/Common/PostShader.cpp
 	GPU/Common/PostShader.h
@@ -1322,11 +1477,12 @@ add_library(GPU OBJECT
 	GPU/GLES/GLES_GPU.h
 	GPU/GLES/FragmentShaderGenerator.cpp
 	GPU/GLES/FragmentShaderGenerator.h
+	GPU/GLES/FragmentTestCache.cpp
+	GPU/GLES/FragmentTestCache.h
 	GPU/GLES/Framebuffer.cpp
 	GPU/GLES/Framebuffer.h
 	GPU/GLES/ShaderManager.cpp
 	GPU/GLES/ShaderManager.h
-	GPU/GLES/Spline.cpp
 	GPU/GLES/StateMapping.cpp
 	GPU/GLES/StateMapping.h
 	GPU/GLES/StencilBuffer.cpp
@@ -1336,9 +1492,6 @@ add_library(GPU OBJECT
 	GPU/GLES/TextureScaler.h
 	GPU/GLES/TransformPipeline.cpp
 	GPU/GLES/TransformPipeline.h
-	GPU/GLES/SoftwareTransform.cpp
-	GPU/GLES/VertexDecoder.cpp
-	GPU/GLES/VertexDecoder.h
 	GPU/GLES/VertexShaderGenerator.cpp
 	GPU/GLES/VertexShaderGenerator.h
 	GPU/GPUInterface.h
@@ -1463,34 +1616,46 @@ endif()
 if(UNITTEST)
 	add_executable(unitTest
 		unittest/UnitTest.cpp
+		unittest/TestArmEmitter.cpp
+		unittest/TestArm64Emitter.cpp
+		unittest/TestX64Emitter.cpp
+		unittest/JitHarness.cpp
+		Core/MIPS/ARM/ArmRegCache.cpp
+		Core/MIPS/ARM/ArmRegCacheFPU.cpp
+		UI/OnScreenDisplay.cpp
 	)
 	target_link_libraries(unitTest
-		${COCOA_LIBRARY} ${LinkCommon})
+		${COCOA_LIBRARY} ${LinkCommon} Common)
 	setup_target_project(unitTest unittest)
 endif()
 
 if (TargetBin)
 	if (IOS OR APPLE)
-		set(ICON_PATH_ABS ${CMAKE_CURRENT_SOURCE_DIR}/assets/icon-114.icns)
-		set( MACOSX_BUNDLE_ICON_FILE icon-114.icns )
+		if (APPLE AND NOT IOS)
+		set(ICON_PATH_ABS ${CMAKE_CURRENT_SOURCE_DIR}/assets/ppsspp.icns)
+		set( MACOSX_BUNDLE_ICON_FILE ppsspp.icns )
 		set_source_files_properties(${ICON_PATH_ABS} PROPERTIES MACOSX_PACKAGE_LOCATION "Resources")
+		endif()
 
 		# TODO: there must a native way to copy these.
 		# Now this is very prone to errors when changes occur.
-		# Also better to have assets under Resources dir.
+		# Also better to have assets under Resources dir for OS X.
 		file(GLOB_RECURSE FLASH0_FILES flash0/*)
 		file(GLOB_RECURSE LANG_FILES lang/*)
 		file(GLOB_RECURSE SHADER_FILES assets/shaders/*)
+
+		if (APPLE AND NOT IOS)
 		set_source_files_properties(${NativeAssets} PROPERTIES MACOSX_PACKAGE_LOCATION "MacOS/assets")
 		set_source_files_properties(${FLASH0_FILES} PROPERTIES MACOSX_PACKAGE_LOCATION "MacOS/assets/flash0/font")
 		set_source_files_properties(${LANG_FILES} PROPERTIES MACOSX_PACKAGE_LOCATION "MacOS/assets/lang")
 		set_source_files_properties(${SHADER_FILES} PROPERTIES MACOSX_PACKAGE_LOCATION "MacOS/assets/shaders")
-		
+		endif()
+
 		add_executable(${TargetBin} MACOSX_BUNDLE ${ICON_PATH_ABS} ${NativeAssets} ${SHADER_FILES} ${FLASH0_FILES} ${LANG_FILES} ${NativeAppSource})
 	else()
 		add_executable(${TargetBin} ${NativeAppSource})
 	endif()
-	target_link_libraries(${TargetBin} ${LinkCommon})
+	target_link_libraries(${TargetBin} ${LinkCommon} Common)
 endif()
 
 # installs
@@ -1516,7 +1681,7 @@ if(IOS)
 	)
 	set(APP_DIR_NAME \${TARGET_BUILD_DIR}/\${FULL_PRODUCT_NAME})
 	add_custom_command(TARGET PPSSPP POST_BUILD
-		COMMAND tar -c -C . --exclude .DS_Store --exclude .git -H assets | tar -x -C '${APP_DIR_NAME}'
+		COMMAND tar -c -C . --exclude .DS_Store --exclude .git -H gnu assets | tar -x -C '${APP_DIR_NAME}'
 	)
 	# Force Xcode to relink the binary.
 	add_custom_command(TARGET Core PRE_BUILD

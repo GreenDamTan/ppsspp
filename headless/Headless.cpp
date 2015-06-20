@@ -7,6 +7,7 @@
 #include <limits>
 
 #include "file/zip_read.h"
+#include "profiler/profiler.h"
 #include "Common/FileUtil.h"
 #include "Core/Config.h"
 #include "Core/Core.h"
@@ -66,11 +67,13 @@ public:
 };
 
 struct InputState;
-// Temporary hack around annoying linking error.
+// Temporary hacks around annoying linking errors.
+void D3D9_SwapBuffers() { }
 void GL_SwapBuffers() { }
 void NativeUpdate(InputState &input_state) { }
 void NativeRender() { }
 void NativeResized() { }
+void NativeMessageReceived(const char *message, const char *value) {}
 
 std::string System_GetProperty(SystemProperty prop) { return ""; }
 int System_GetPropertyInt(SystemProperty prop) { return -1; }
@@ -93,7 +96,7 @@ int printUsage(const char *progname, const char *reason)
 	fprintf(stderr, "  -r, --root some/path  mount path on host0: (elfs must be in here)\n");
 	fprintf(stderr, "  -l, --log             full log output, not just emulated printfs\n");
 
-#if HEADLESSHOST_CLASS != HeadlessHost
+#if defined(HEADLESSHOST_CLASS)
 	{
 		fprintf(stderr, "  --graphics=BACKEND    use the full gpu backend (slower)\n");
 		fprintf(stderr, "                        options: gles, software, directx9\n");
@@ -111,16 +114,21 @@ int printUsage(const char *progname, const char *reason)
 	return 1;
 }
 
-static HeadlessHost * getHost(GPUCore gpuCore) {
-	switch(gpuCore) {
+static HeadlessHost *getHost(GPUCore gpuCore) {
+	switch (gpuCore) {
 	case GPU_NULL:
 		return new HeadlessHost();
 #ifdef _WIN32
 	case GPU_DIRECTX9:
 		return new WindowsHeadlessHostDx9();
 #endif
+#ifdef HEADLESSHOST_CLASS
 	default:
 		return new HEADLESSHOST_CLASS();
+#else
+	default:
+		return new HeadlessHost();
+#endif
 	}
 }
 
@@ -194,6 +202,8 @@ bool RunAutoTest(HeadlessHost *headlessHost, CoreParameter &coreParameter, bool 
 
 int main(int argc, const char* argv[])
 {
+	PROFILE_INIT();
+
 #ifdef ANDROID_NDK_PROFILER
 	setenv("CPUPROFILE_FREQUENCY", "500", 1);
 	setenv("CPUPROFILE", "/sdcard/gmon.out", 1);
@@ -286,7 +296,7 @@ int main(int argc, const char* argv[])
 	host = headlessHost;
 
 	std::string error_string;
-	bool glWorking = host->InitGL(&error_string);
+	bool glWorking = host->InitGraphics(&error_string);
 
 	LogManager::Init();
 	LogManager *logman = LogManager::GetInstance();
@@ -343,11 +353,10 @@ int main(int argc, const char* argv[])
 	g_Config.bFrameSkipUnthrottle = false;
 	g_Config.bEnableLogging = fullLog;
 	g_Config.iNumWorkerThreads = 1;
-	g_Config.iBGMVolume = MAX_CONFIG_VOLUME;
-	g_Config.iSFXVolume = MAX_CONFIG_VOLUME;
 	g_Config.bSoftwareSkinning = true;
 	g_Config.bVertexDecoderJit = true;
 	g_Config.bBlockTransferGPU = true;
+	g_Config.bSetRoundingMode = true;
 
 #ifdef _WIN32
 	InitSysDirectories();
@@ -356,7 +365,7 @@ int main(int argc, const char* argv[])
 #if defined(ANDROID)
 #elif defined(BLACKBERRY) || defined(__SYMBIAN32__)
 #elif !defined(_WIN32)
-	g_Config.memCardDirectory = std::string(getenv("HOME")) + "/.ppsspp/";
+	g_Config.memStickDirectory = std::string(getenv("HOME")) + "/.ppsspp/";
 #endif
 
 	// Try to find the flash0 directory.  Often this is from a subdirectory.
@@ -418,7 +427,7 @@ int main(int argc, const char* argv[])
 		}
 	}
 
-	host->ShutdownGL();
+	host->ShutdownGraphics();
 	delete host;
 	host = NULL;
 	headlessHost = NULL;

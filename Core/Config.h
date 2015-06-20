@@ -27,7 +27,6 @@
 extern const char *PPSSPP_GIT_VERSION;
 #endif
 
-const int MAX_CONFIG_VOLUME = 8;
 const int PSP_MODEL_FAT = 0;
 const int PSP_MODEL_SLIM = 1;
 const int PSP_DEFAULT_FIRMWARE = 150;
@@ -38,6 +37,30 @@ enum {
 	ROTATION_LOCKED_VERTICAL = 2,
 	ROTATION_LOCKED_HORIZONTAL180 = 3,
 	ROTATION_LOCKED_VERTICAL180 = 4,
+};
+
+enum BufferFilter {
+	SCALE_LINEAR = 1,
+	SCALE_NEAREST = 2,
+};
+
+// Software is not among these because it will have one of these perform the blit to display.
+enum {
+	GPU_BACKEND_OPENGL = 0,
+	GPU_BACKEND_DIRECT3D9 = 1,
+};
+
+enum AudioBackendType {
+	AUDIO_BACKEND_AUTO,
+	AUDIO_BACKEND_DSOUND,
+	AUDIO_BACKEND_WASAPI,
+};
+
+// For iIOTimingMethod.
+enum IOTimingMethods {
+	IOTIMING_FAST = 0,
+	IOTIMING_HOST = 1,
+	IOTIMING_REALISTIC = 2,
 };
 
 namespace http {
@@ -55,6 +78,7 @@ public:
 	// Whether to save the config on close.
 	bool bSaveSettings;
 	bool bFirstRun;
+	bool bGameSpecific;
 
 	int iRunCount; // To be used to for example check for updates every 10 runs and things like that.
 
@@ -72,6 +96,12 @@ public:
 	bool bTopMost;
 	std::string sFont;
 	bool bIgnoreWindowsKey;
+
+	// Used for switching the GPU backend in GameSettingsScreen.
+	// Without this, PPSSPP instantly crashes if we edit iGPUBackend directly...
+	int iTempGPUBackend;
+
+	bool bRestartRequired;
 #endif
 
 	bool bPauseWhenMinimized;
@@ -87,28 +117,34 @@ public:
 	bool bCheckForNewVersion;
 	bool bForceLagSync;
 	bool bFuncReplacements;
+	bool bSetRoundingMode;
+	bool bForceFlushToZero;
 
 	// Definitely cannot be changed while game is running.
 	bool bSeparateCPUThread;
+	int iIOTimingMethod;
 	bool bSeparateIOThread;
-	bool bAtomicAudioLocks;
 	int iLockedCPUSpeed;
 	bool bAutoSaveSymbolMap;
-	int iScreenRotation;
+	bool bCacheFullIsoInRam;
+
+	int iScreenRotation;  // The rotation angle of the PPSSPP UI. Only supported on Android and possibly other mobile platforms.
+	int iInternalScreenRotation;  // The internal screen rotation angle. Useful for vertical SHMUPs and similar.
 
 	std::string sReportHost;
 	std::vector<std::string> recentIsos;
 	std::vector<std::string> vPinnedPaths;
 	std::string sLanguageIni;
 
-
 	// GFX
+	int iGPUBackend;
 	bool bSoftwareRendering;
 	bool bHardwareTransform; // only used in the GLES backend
 	bool bSoftwareSkinning;  // may speed up some games
 
 	int iRenderingMode; // 0 = non-buffered rendering 1 = buffered rendering 2 = Read Framebuffer to memory (CPU) 3 = Read Framebuffer to memory (GPU)
 	int iTexFiltering; // 1 = off , 2 = nearest , 3 = linear , 4 = linear(CG)
+	int iBufFilter; // 1 = linear, 2 = nearest
 	bool bPartialStretch;
 	bool bStretchToDisplay;
 	bool bSmallDisplay;  // Useful on large tablets with touch controls to not overlap the image. Temporary setting - will be replaced by more comprehensive display size settings.
@@ -117,6 +153,11 @@ public:
 	int iFrameSkip;
 	bool bAutoFrameSkip;
 	bool bFrameSkipUnthrottle;
+
+	bool bEnableCardboard; // Cardboard Master Switch
+	int iCardboardScreenSize; // Screen Size (in %)
+	int iCardboardXShift; // X-Shift of Screen (in %)
+	int iCardboardYShift; // Y-Shift of Screen (in %)
 
 	int iWindowX;
 	int iWindowY;
@@ -143,20 +184,23 @@ public:
 	bool bEnableAutoLoad;
 	bool bEnableCheats;
 	bool bReloadCheats;
+	int iCwCheatRefreshRate;
 	bool bDisableStencilTest;
 	bool bAlwaysDepthWrite;
+	bool bDepthRangeHack;
+	int iBloomHack; //0 = off, 1 = safe, 2 = balanced, 3 = aggressive
 	bool bTimerHack;
 	bool bAlphaMaskHack;
 	bool bBlockTransferGPU;
 	bool bDisableSlowFramebufEffects;
+	bool bFragmentTestCache;
 	int iSplineBezierQuality; // 0 = low , 1 = Intermediate , 2 = High
 	std::string sPostShaderName;  // Off for off.
 
 	// Sound
 	bool bEnableSound;
-	int IaudioLatency; // 0 = low , 1 = medium(default) , 2 = high
-	int iSFXVolume;
-	int iBGMVolume;
+	int iAudioLatency; // 0 = low , 1 = medium(default) , 2 = high
+	int iAudioBackend;
 
 	// Audio Hack
 	bool bSoundSpeedHack;
@@ -164,7 +208,10 @@ public:
 	// UI
 	bool bShowDebuggerOnLoad;
 	int iShowFPSCounter;
+
 	bool bShowDebugStats;
+	bool bShowAudioDebug;
+	bool bAudioResampler;
 
 	//Analog stick tilting
 	//the base x and y tilt. this inclination is treated as (0,0) and the tilt input
@@ -189,10 +236,14 @@ public:
 
 	// Disable diagonals
 	bool bDisableDpadDiagonals;
+	bool bGamepadOnlyFocused;
 	// Control Style
 	int iTouchButtonStyle;
 	// Control Positions
 	int iTouchButtonOpacity;
+	// Floating analog stick (recenters on thumb on press).
+	bool bAutoCenterTouchAnalog;
+
 	//space between PSP buttons
 	//the PSP button's center (triangle, circle, square, cross)
 	float fActionButtonCenterX, fActionButtonCenterY;
@@ -248,6 +299,17 @@ public:
 
 	bool bHapticFeedback;
 
+	float fDInputAnalogDeadzone;
+	int iDInputAnalogInverseMode;
+	float fDInputAnalogInverseDeadzone;
+	float fDInputAnalogSensitivity;
+
+	float fXInputAnalogDeadzone;
+	int iXInputAnalogInverseMode;
+	float fXInputAnalogInverseDeadzone;
+	float fXInputAnalogSensitivity;
+
+	float fAnalogLimiterDeadzone;
 	// GLES backend-specific hacks. Not saved to the ini file, do not add checkboxes. Will be made into
 	// proper options when good enough.
 	// PrescaleUV:
@@ -281,6 +343,7 @@ public:
 
 	// Networking
 	bool bEnableWlan;
+	bool bEnableAdhocServer;
 	int iWlanAdhocChannel;
 	bool bWlanPowerSave;
 
@@ -311,9 +374,12 @@ public:
 	bool bSkipDeadbeefFilling;
 	bool bFuncHashMap;
 
+	// Volatile development settings
+	bool bShowFrameProfiler;
+
 	std::string currentDirectory;
 	std::string externalDirectory; 
-	std::string memCardDirectory;
+	std::string memStickDirectory;
 	std::string flash0Directory;
 	std::string internalDataDirectory;
 
@@ -322,9 +388,19 @@ public:
 	std::string upgradeVersion;
 	std::string dismissedVersion;
 
-	void Load(const char *iniFileName = "ppsspp.ini", const char *controllerIniFilename = "controls.ini");
+	void Load(const char *iniFileName = nullptr, const char *controllerIniFilename = nullptr);
 	void Save();
 	void RestoreDefaults();
+	
+	//per game config managment, should maybe be in it's own class
+	void changeGameSpecific(const std::string &gameId = "");
+	bool createGameConfig(const std::string &game_id);
+	bool deleteGameConfig(const std::string& pGameId);
+	bool loadGameConfig(const std::string &game_id);
+	bool saveGameConfig(const std::string &pGameId);
+	void unloadGameConfig();
+	std::string getGameConfigFile(const std::string &gameId);
+	bool hasGameConfig(const std::string &game_id);
 
 	// Used when the file is not found in the search path.  Trailing slash.
 	void SetDefaultPath(const std::string &defaultPath);
@@ -342,13 +418,18 @@ public:
 	void ResetControlLayout();
 
 	void GetReportingInfo(UrlEncoder &data);
-	
+
+	bool IsPortrait() const {
+		return (iInternalScreenRotation == ROTATION_LOCKED_VERTICAL || iInternalScreenRotation == ROTATION_LOCKED_VERTICAL180) && iRenderingMode != 0;
+	}
 	
 private:
+	std::string gameId_;
 	std::string iniFilename_;
 	std::string controllerIniFilename_;
 	std::vector<std::string> searchPath_;
 	std::string defaultPath_;
+	std::string createdPath_;
 };
 
 std::map<std::string, std::pair<std::string, int>> GetLangValuesMapping();

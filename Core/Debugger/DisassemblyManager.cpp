@@ -42,7 +42,11 @@ bool isInInterval(u32 start, u32 size, u32 value)
 
 static u32 computeHash(u32 address, u32 size)
 {
-	return XXH32(Memory::GetPointer(address),size,0xBACD7814);
+#ifdef _M_X64
+	return XXH64(Memory::GetPointer(address), size, 0xBACD7814BACD7814LL);
+#else
+	return XXH32(Memory::GetPointer(address), size, 0xBACD7814);
+#endif
 }
 
 
@@ -356,7 +360,7 @@ void DisassemblyFunction::recheck()
 	if (!PSP_IsInited())
 		return;
 
-	u32 newHash = computeHash(address,size);
+	HashType newHash = computeHash(address,size);
 	if (hash != newHash)
 	{
 		hash = newHash;
@@ -635,6 +639,7 @@ void DisassemblyFunction::load()
 						dataSize = 16;
 						break;
 					default:
+						delete macro;
 						return;
 					}
 
@@ -772,7 +777,7 @@ bool DisassemblyMacro::disassemble(u32 address, DisassemblyLineInfo& dest, bool 
 		dest.params = buffer;
 		
 		dest.info.hasRelevantAddress = true;
-		dest.info.releventAddress = immediate;
+		dest.info.relevantAddress = immediate;
 		break;
 	case MACRO_MEMORYIMM:
 		dest.name = name;
@@ -792,7 +797,7 @@ bool DisassemblyMacro::disassemble(u32 address, DisassemblyLineInfo& dest, bool 
 		dest.info.dataSize = dataSize;
 
 		dest.info.hasRelevantAddress = true;
-		dest.info.releventAddress = immediate;
+		dest.info.relevantAddress = immediate;
 		break;
 	default:
 		return false;
@@ -819,7 +824,7 @@ void DisassemblyData::recheck()
 	if (!PSP_IsInited())
 		return;
 
-	u32 newHash = computeHash(address,size);
+	HashType newHash = computeHash(address,size);
 	if (newHash != hash)
 	{
 		hash = newHash;
@@ -959,7 +964,7 @@ void DisassemblyData::createLines()
 	} else {
 		while (pos < end)
 		{
-			char buffer[64];
+			char buffer[256];
 			u32 value;
 
 			u32 currentPos = pos;
@@ -968,12 +973,12 @@ void DisassemblyData::createLines()
 			{
 			case DATATYPE_BYTE:
 				value = Memory::Read_U8(pos);
-				sprintf(buffer,"0x%02X",value);
+				snprintf(buffer, sizeof(buffer), "0x%02X", value);
 				pos++;
 				break;
 			case DATATYPE_HALFWORD:
 				value = Memory::Read_U16(pos);
-				sprintf(buffer,"0x%04X",value);
+				snprintf(buffer, sizeof(buffer), "0x%04X", value);
 				pos += 2;
 				break;
 			case DATATYPE_WORD:
@@ -981,9 +986,9 @@ void DisassemblyData::createLines()
 					value = Memory::Read_U32(pos);
 					const std::string label = symbolMap.GetLabelString(value);
 					if (!label.empty())
-						sprintf(buffer,"%s",label.c_str());
+						snprintf(buffer, sizeof(buffer), "%s", label.c_str());
 					else
-						sprintf(buffer,"0x%08X",value);
+						snprintf(buffer, sizeof(buffer), "0x%08X", value);
 					pos += 4;
 				}
 				break;
@@ -1007,8 +1012,7 @@ void DisassemblyData::createLines()
 			currentLine += buffer;
 		}
 
-		if (currentLine.size() != 0)
-		{
+		if (currentLine.size() != 0) {
 			DataEntry entry = {currentLine,pos-currentLineStart,lineCount++};
 			lines[currentLineStart] = entry;
 			lineAddresses.push_back(currentLineStart);

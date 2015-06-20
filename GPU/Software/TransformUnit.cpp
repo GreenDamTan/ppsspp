@@ -19,8 +19,8 @@
 #include "Core/Host.h"
 #include "Core/Config.h"
 #include "GPU/GPUState.h"
-#include "GPU/GLES/VertexDecoder.h"
 #include "GPU/GLES/TransformPipeline.h"
+#include "GPU/Common/VertexDecoderCommon.h"
 #include "GPU/Common/SplineCommon.h"
 
 #include "GPU/Software/TransformUnit.h"
@@ -28,7 +28,7 @@
 #include "GPU/Software/Lighting.h"
 
 static u8 buf[65536 * 48];  // yolo
-static bool outside_range_flag = false;
+bool TransformUnit::outside_range_flag = false;
 
 WorldCoords TransformUnit::ModelToWorld(const ModelCoords& coords)
 {
@@ -56,7 +56,7 @@ ClipCoords TransformUnit::ViewToClip(const ViewCoords& coords)
 }
 
 // TODO: This is ugly
-static inline ScreenCoords ClipToScreenInternal(const ClipCoords& coords, bool set_flag = true)
+static inline ScreenCoords ClipToScreenInternal(const ClipCoords& coords, bool *outside_range_flag)
 {
 	ScreenCoords ret;
 	// TODO: Check for invalid parameters (x2 < x1, etc)
@@ -78,8 +78,8 @@ static inline ScreenCoords ClipToScreenInternal(const ClipCoords& coords, bool s
 			retz = 65535.f;
 	}
 
-	if (set_flag && (retx > 4095.9375f || rety > 4095.9375f || retx < 0 || rety < 0 || retz < 0 || retz > 65535.f))
-		outside_range_flag = true;
+	if (outside_range_flag && (retx > 4095.9375f || rety > 4095.9375f || retx < 0 || rety < 0 || retz < 0 || retz > 65535.f))
+		*outside_range_flag = true;
 
 	// 16 = 0xFFFF / 4095.9375
 	return ScreenCoords(retx * 16, rety * 16, retz);
@@ -87,7 +87,7 @@ static inline ScreenCoords ClipToScreenInternal(const ClipCoords& coords, bool s
 
 ScreenCoords TransformUnit::ClipToScreen(const ClipCoords& coords)
 {
-	return ClipToScreenInternal(coords, false);
+	return ClipToScreenInternal(coords, nullptr);
 }
 
 DrawingCoords TransformUnit::ScreenToDrawing(const ScreenCoords& coords)
@@ -109,13 +109,13 @@ ScreenCoords TransformUnit::DrawingToScreen(const DrawingCoords& coords)
 	return ret;
 }
 
-static VertexData ReadVertex(VertexReader& vreader)
+VertexData TransformUnit::ReadVertex(VertexReader& vreader)
 {
 	VertexData vertex;
 
 	float pos[3];
 	// VertexDecoder normally scales z, but we want it unscaled.
-	vreader.ReadPosZ16(pos);
+	vreader.ReadPosThroughZ16(pos);
 
 	if (!gstate.isModeClear() && gstate.isTextureMapEnabled() && vreader.hasUV()) {
 		float uv[2];
@@ -141,7 +141,7 @@ static VertexData ReadVertex(VertexReader& vreader)
 
 		for (int i = 0; i < vertTypeGetNumBoneWeights(gstate.vertType); ++i) {
 			Mat3x3<float> bone(&gstate.boneMatrix[12*i]);
-			tmppos += (bone * ModelCoords(pos[0], pos[1], pos[2]) * W[i] + Vec3<float>(gstate.boneMatrix[12*i+9], gstate.boneMatrix[12*i+10], gstate.boneMatrix[12*i+11]));
+			tmppos += (bone * ModelCoords(pos[0], pos[1], pos[2]) + Vec3<float>(gstate.boneMatrix[12*i+9], gstate.boneMatrix[12*i+10], gstate.boneMatrix[12*i+11])) * W[i];
 			if (vreader.hasNormal())
 				tmpnrm += (bone * vertex.normal) * W[i];
 		}
@@ -172,8 +172,14 @@ static VertexData ReadVertex(VertexReader& vreader)
 	if (!gstate.isModeThrough()) {
 		vertex.modelpos = ModelCoords(pos[0], pos[1], pos[2]);
 		vertex.worldpos = WorldCoords(TransformUnit::ModelToWorld(vertex.modelpos));
-		vertex.clippos = ClipCoords(TransformUnit::ViewToClip(TransformUnit::WorldToView(vertex.worldpos)));
-		vertex.screenpos = ClipToScreenInternal(vertex.clippos);
+		ModelCoords viewpos = TransformUnit::WorldToView(vertex.worldpos);
+		vertex.clippos = ClipCoords(TransformUnit::ViewToClip(viewpos));
+		if (gstate.isFogEnabled()) {
+			vertex.fogdepth = (viewpos.z + getFloat24(gstate.fog1)) * getFloat24(gstate.fog2);
+		} else {
+			vertex.fogdepth = 1.0f;
+		}
+		vertex.screenpos = ClipToScreenInternal(vertex.clippos, &outside_range_flag);
 
 		if (vreader.hasNormal()) {
 			vertex.worldnormal = TransformUnit::ModelToWorldNormal(vertex.normal);
@@ -187,6 +193,7 @@ static VertexData ReadVertex(VertexReader& vreader)
 		vertex.screenpos.y = (u32)pos[1] * 16 + gstate.getOffsetY16();
 		vertex.screenpos.z = pos[2];
 		vertex.clippos.w = 1.f;
+		vertex.fogdepth = 1.f;
 	}
 
 	return vertex;
@@ -209,7 +216,10 @@ int TransformUnit::patchBufferSize_ = 0;
 void TransformUnit::SubmitSpline(void* control_points, void* indices, int count_u, int count_v, int type_u, int type_v, GEPatchPrimType prim_type, u32 vertex_type)
 {
 	VertexDecoder vdecoder;
-	vdecoder.SetVertexType(vertex_type);
+	VertexDecoderOptions options;
+	memset(&options, 0, sizeof(options));
+	options.expandAllUVtoFloat = false;
+	vdecoder.SetVertexType(vertex_type, options);
 	const DecVtxFormat& vtxfmt = vdecoder.GetDecVtxFmt();
 
 	static u8 buf[65536 * 48]; // yolo
@@ -290,7 +300,10 @@ void TransformUnit::SubmitPrimitive(void* vertices, void* indices, u32 prim_type
 {
 	// TODO: Cache VertexDecoder objects
 	VertexDecoder vdecoder;
-	vdecoder.SetVertexType(vertex_type);
+	VertexDecoderOptions options;
+	memset(&options, 0, sizeof(options));
+	options.expandAllUVtoFloat = false;
+	vdecoder.SetVertexType(vertex_type, options);
 	const DecVtxFormat& vtxfmt = vdecoder.GetDecVtxFmt();
 
 	if (bytesRead)
@@ -528,8 +541,11 @@ bool TransformUnit::GetCurrentSimpleVertices(int count, std::vector<GPUDebugVert
 	simpleVertices.resize(indexUpperBound + 1);
 
 	VertexDecoder vdecoder;
-	vdecoder.SetVertexType(gstate.vertType);
-	TransformDrawEngine::NormalizeVertices((u8 *)(&simpleVertices[0]), (u8 *)(&temp_buffer[0]), Memory::GetPointer(gstate_c.vertexAddr), &vdecoder, indexLowerBound, indexUpperBound, gstate.vertType);
+	VertexDecoderOptions options;
+	memset(&options, 0, sizeof(options));
+	options.expandAllUVtoFloat = false;  // TODO: True should be fine here
+	vdecoder.SetVertexType(gstate.vertType, options);
+	DrawEngineCommon::NormalizeVertices((u8 *)(&simpleVertices[0]), (u8 *)(&temp_buffer[0]), Memory::GetPointer(gstate_c.vertexAddr), &vdecoder, indexLowerBound, indexUpperBound, gstate.vertType);
 
 	float world[16];
 	float view[16];

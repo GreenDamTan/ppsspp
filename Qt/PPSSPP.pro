@@ -1,4 +1,4 @@
-TARGET = PPSSPPQt
+TARGET = ppsspp
 
 # Main Qt modules
 QT += core gui opengl
@@ -37,11 +37,11 @@ greaterThan(QT_MAJOR_VERSION,4) {
 macx|equals(PLATFORM_NAME, "linux") {
 	PRE_TARGETDEPS += $$CONFIG_DIR/libCommon.a $$CONFIG_DIR/libCore.a $$CONFIG_DIR/libGPU.a $$CONFIG_DIR/libNative.a
 	CONFIG += link_pkgconfig
-	packagesExist(sdl) {
-		DEFINES += QT_HAS_SDL
+	packagesExist(sdl2) {
+		DEFINES += SDL
 		SOURCES += $$P/SDL/SDLJoystick.cpp
 		HEADERS += $$P/SDL/SDLJoystick.h
-		PKGCONFIG += sdl
+		PKGCONFIG += sdl2
 		macx {
 			LIBS += -F/Library/Frameworks -framework SDL
 			INCLUDEPATH += /Library/Frameworks/SDL.framework/Versions/A/Headers
@@ -54,7 +54,7 @@ unix:contains(QT_CONFIG, system-zlib) {
 }
 
 # Qt Multimedia (if SDL is not found)
-!contains(DEFINES, QT_HAS_SDL) {
+!contains(DEFINES, SDL) {
 	lessThan(QT_MAJOR_VERSION,5):!exists($$[QT_INSTALL_HEADERS]/QtMultimedia) {
 		# Fallback to mobility audio
 		CONFIG += mobility
@@ -79,18 +79,19 @@ HEADERS += $$P/UI/*.h
 
 INCLUDEPATH += $$P $$P/Common $$P/native $$P/native/ext $$P/native/ext/glew
 
-mobile_platform: RESOURCES += $$P/Qt/assets.qrc
-else {
+mobile_platform {
+	!no_assets: RESOURCES += $$P/Qt/assets.qrc
+} else {
 	# TODO: Rewrite Debugger with same backend as Windows version
 	# Do not use .ui forms. Use Qt5 + C++11 features to minimise code
 	SOURCES += $$P/Qt/*.cpp $$P/Qt/Debugger/*.cpp
 	HEADERS += $$P/Qt/*.h $$P/Qt/Debugger/*.h
 	FORMS += $$P/Qt/Debugger/*.ui
-	RESOURCES += $$P/Qt/desktop_assets.qrc
+	!no_assets: RESOURCES += $$P/Qt/desktop_assets.qrc
 	INCLUDEPATH += $$P/Qt $$P/Qt/Debugger
 	
 	# Creating translations should be done by Qt, really
-	LREL_TOOL = lrelease
+	isEmpty(LREL_TOOL): LREL_TOOL = lrelease
 	# Grab all possible directories (win32/unix)
 	win32: PATHS = $$split($$(PATH), ;)
 	else: PATHS = $$split($$(PATH), :)

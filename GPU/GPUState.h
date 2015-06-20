@@ -276,13 +276,13 @@ struct GPUgstate
 
 	// Alpha Test
 	bool isAlphaTestEnabled() const { return alphaTestEnable & 1; }
-	GEComparison getAlphaTestFunction() { return static_cast<GEComparison>(alphatest & 0x7); }
+	GEComparison getAlphaTestFunction() const { return static_cast<GEComparison>(alphatest & 0x7); }
 	int getAlphaTestRef() const { return (alphatest >> 8) & 0xFF; }
 	int getAlphaTestMask() const { return (alphatest >> 16) & 0xFF; }
 	
 	// Color Test
 	bool isColorTestEnabled() const { return colorTestEnable & 1; }
-	GEComparison getColorTestFunction() { return static_cast<GEComparison>(colortest & 0x3); }
+	GEComparison getColorTestFunction() const { return static_cast<GEComparison>(colortest & 0x3); }
 	u32 getColorTestRef() const { return colorref & 0xFFFFFF; }
 	u32 getColorTestMask() const { return colortestmask & 0xFFFFFF; }
 
@@ -302,14 +302,18 @@ struct GPUgstate
 	int getTextureEnvColR() const { return texenvcolor&0xFF; }
 	int getTextureEnvColG() const { return (texenvcolor>>8)&0xFF; }
 	int getTextureEnvColB() const { return (texenvcolor>>16)&0xFF; }
-	u32 getClutAddress() const { return (clutaddr & 0x00FFFFFF) | ((clutaddrupper << 8) & 0x0F000000); }
+	u32 getClutAddress() const { return (clutaddr & 0x00FFFFF0) | ((clutaddrupper << 8) & 0x0F000000); }
 	int getClutLoadBytes() const { return (loadclut & 0x3F) * 32; }
 	int getClutLoadBlocks() const { return (loadclut & 0x3F); }
-	GEPaletteFormat getClutPaletteFormat() { return static_cast<GEPaletteFormat>(clutformat & 3); }
+	GEPaletteFormat getClutPaletteFormat() const { return static_cast<GEPaletteFormat>(clutformat & 3); }
 	int getClutIndexShift() const { return (clutformat >> 2) & 0x1F; }
 	int getClutIndexMask() const { return (clutformat >> 8) & 0xFF; }
 	int getClutIndexStartPos() const { return ((clutformat >> 16) & 0x1F) << 4; }
-	int transformClutIndex(int index) const { return ((index >> getClutIndexShift()) & getClutIndexMask()) | getClutIndexStartPos(); }
+	u32 transformClutIndex(u32 index) const {
+		// We need to wrap any entries beyond the first 1024 bytes.
+		u32 mask = getClutPaletteFormat() == GE_CMODE_32BIT_ABGR8888 ? 0xFF : 0x1FF;
+		return ((index >> getClutIndexShift()) & getClutIndexMask()) | (getClutIndexStartPos() & mask);
+	}
 	bool isClutIndexSimple() const { return (clutformat & ~3) == 0xC500FF00; } // Meaning, no special mask, shift, or start pos.
 	bool isTextureSwizzled() const { return texmode & 1; }
 	bool isClutSharedForMipmaps() const { return (texmode & 0x100) == 0; }
@@ -460,9 +464,12 @@ struct GPUStateCache
 
 	UVScale uv;
 	bool flipTexture;
+	bool bgraTexture;
 	bool needShaderTexClamp;
+	bool allowShaderBlend;
 
 	float morphWeights[8];
+	u32 deferredVertTypeDirty;
 
 	u32 curTextureWidth;
 	u32 curTextureHeight;
@@ -473,6 +480,12 @@ struct GPUStateCache
 
 	float vpWidth;
 	float vpHeight;
+	float vpDepth;
+	// Only used by Direct3D, not saved.
+	float vpXOffset;
+	float vpYOffset;
+	float vpWidthScale;
+	float vpHeightScale;
 
 	u32 curRTWidth;
 	u32 curRTHeight;

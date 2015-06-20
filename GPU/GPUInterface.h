@@ -142,6 +142,7 @@ struct DisplayList
 	PSPPointer<u32_le> context;
 	u32 offsetAddr;
 	bool bboxResult;
+	u32 stackAddr;
 };
 
 enum GPUInvalidationType {
@@ -274,6 +275,7 @@ public:
 	virtual bool FramebufferDirty() = 0;
 	virtual bool FramebufferReallyDirty() = 0;
 	virtual bool BusyDrawing() = 0;
+	virtual void SetThreadEnabled(bool threadEnabled) = 0;
 
 	// If any jit is being used inside the GPU.
 	virtual bool DescribeCodePtr(const u8 *ptr, std::string &name) = 0;
@@ -282,6 +284,6 @@ public:
 	virtual void DumpNextFrame() = 0;
 	virtual void GetReportingInfo(std::string &primaryInfo, std::string &fullInfo) = 0;
 	virtual const std::list<int>& GetDisplayLists() = 0;
-	virtual bool DecodeTexture(u8* dest, GPUgstate state) = 0;
+	virtual bool DecodeTexture(u8* dest, const GPUgstate &state) = 0;
 	virtual std::vector<FramebufferInfo> GetFramebufferList() = 0;
 };

@@ -32,6 +32,7 @@ set(SRCS
   HLE/sceAtrac.cpp
   HLE/__sceAudio.cpp
   HLE/sceAudio.cpp
+  HLE/sceAudioRouting.cpp
   HLE/sceCcc.cpp
   HLE/sceChnnlsv.cpp
   HLE/sceCtrl.cpp
@@ -73,6 +74,7 @@ set(SRCS
   HLE/sceSas.cpp
   HLE/sceUmd.cpp
   HLE/sceUsb.cpp
+  HLE/sceUsbGps.cpp
   HLE/sceUtility.cpp
   HLE/sceParseUri.cpp
   HLE/sceSsl.cpp
@@ -100,7 +102,6 @@ set(SRCS
   MemMap.cpp
   MemMapFunctions.cpp
   PSPLoaders.cpp
-  PSPMixer.cpp
   System.cpp
   Core.cpp
   ../git-version.cpp

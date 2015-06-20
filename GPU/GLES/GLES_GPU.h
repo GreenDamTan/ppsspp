@@ -27,6 +27,7 @@
 #include "GPU/GLES/TransformPipeline.h"
 #include "GPU/GLES/TextureCache.h"
 #include "GPU/GLES/DepalettizeShader.h"
+#include "GPU/GLES/FragmentTestCache.h"
 
 class ShaderManager;
 class LinkedShader;
@@ -38,7 +39,7 @@ public:
 	virtual void InitClear();
 	virtual void Reinitialize();
 	virtual void PreExecuteOp(u32 op, u32 diff);
-	void ExecuteOpInternal(u32 op, u32 diff);
+	void Execute_Generic(u32 op, u32 diff);
 	virtual void ExecuteOp(u32 op, u32 diff);
 
 	virtual void SetDisplayFramebuffer(u32 framebuf, u32 stride, GEBufferFormat format);
@@ -61,7 +62,7 @@ public:
 	virtual void Resized();
 	virtual void ClearShaderCache();
 	virtual void CleanupBeforeUI();
-	virtual bool DecodeTexture(u8* dest, GPUgstate state) {
+	virtual bool DecodeTexture(u8 *dest, const GPUgstate &state) {
 		return textureCache_.DecodeTexture(dest, state);
 	}
 	virtual bool FramebufferDirty();
@@ -77,6 +78,7 @@ public:
 	bool GetCurrentDepthbuffer(GPUDebugBuffer &buffer);
 	bool GetCurrentStencilbuffer(GPUDebugBuffer &buffer);
 	bool GetCurrentTexture(GPUDebugBuffer &buffer, int level);
+	static bool GetDisplayFramebuffer(GPUDebugBuffer &buffer);
 	bool GetCurrentSimpleVertices(int count, std::vector<GPUDebugVertex> &vertices, std::vector<u16> &indices);
 
 	virtual bool DescribeCodePtr(const u8 *ptr, std::string &name);
@@ -144,9 +146,10 @@ public:
 	void Execute_BlockTransferStart(u32 op, u32 diff);
 
 protected:
-	virtual void FastRunLoop(DisplayList &list);
-	virtual void ProcessEvent(GPUEvent ev);
-	virtual void FastLoadBoneMatrix(u32 target);
+	void FastRunLoop(DisplayList &list) override;
+	void ProcessEvent(GPUEvent ev) override;
+	void FastLoadBoneMatrix(u32 target) override;
+	void FinishDeferred() override;
 
 private:
 	void Flush() {
@@ -173,6 +176,7 @@ private:
 	TextureCache textureCache_;
 	DepalShaderCache depalShaderCache_;
 	TransformDrawEngine transformDraw_;
+	FragmentTestCache fragmentTestCache_;
 	ShaderManager *shaderManager_;
 
 	bool resized_;

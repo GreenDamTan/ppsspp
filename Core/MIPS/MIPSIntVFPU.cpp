@@ -70,6 +70,12 @@
 #define M_SQRT1_2  0.707106781186547524401f
 #endif
 
+union FloatBits {
+	float f[4];
+	u32 u[4];
+	int i[4];
+};
+
 // Preserves NaN in first param, takes sign of equal second param.
 // Technically, std::max may do this but it's undefined.
 inline float nanmax(float f, float cst)
@@ -280,7 +286,7 @@ namespace MIPSInt
 				_dbg_assert_msg_(CPU, 0, "Misaligned sv.q");
 			}
 #ifndef COMMON_BIG_ENDIAN
-			ReadVector((float*)Memory::GetPointer(addr), V_Quad, vt);
+			ReadVector(reinterpret_cast<float *>(Memory::GetPointer(addr)), V_Quad, vt);
 #else
 			float svqd[4];
 			ReadVector(svqd, V_Quad, vt);
@@ -384,7 +390,10 @@ namespace MIPSInt
 		else if (type == 7)
 			f[0] = Float16ToFloat32((u16)uimm16);   // vfim
 		else
+		{
 			_dbg_assert_msg_(CPU,0,"Trying to interpret instruction that can't be interpreted");
+			f[0] = 0;
+		}
 		
 		ApplyPrefixD(f, V_Single);
 		V(vt) = f[0];
@@ -644,8 +653,8 @@ namespace MIPSInt
 				}
 			}
 		}
-		ApplyPrefixD((float*)d, sz, true);
-		WriteVector((float*)d, sz, vd);
+		ApplyPrefixD(reinterpret_cast<float *>(d), sz, true);
+		WriteVector(reinterpret_cast<float *>(d), sz, vd);
 		PC += 4;
 		EatPrefixes();
 	}
@@ -659,8 +668,8 @@ namespace MIPSInt
 		int imm = (op >> 16) & 0x1f;
 		float mult = 1.0f/(float)(1UL << imm);
 		VectorSize sz = GetVecSize(op);
-		ReadVector((float*)&s[0], sz, vs);
-		ApplySwizzleS((float*)&s[0], sz); //TODO: and the mask to kill everything but swizzle
+		ReadVector(reinterpret_cast<float *>(s), sz, vs);
+		ApplySwizzleS(reinterpret_cast<float *>(s), sz); //TODO: and the mask to kill everything but swizzle
 		for (int i = 0; i < GetNumVectorElements(sz); i++)
 		{
 			d[i] = (float)s[i] * mult;
@@ -678,8 +687,8 @@ namespace MIPSInt
 		int vd = _VD;
 		int vs = _VS;
 		VectorSize sz = GetVecSize(op);
-		ReadVector((float*)&s[0], sz, vs);
-		ApplySwizzleS((float*)&s[0], sz);
+		ReadVector(reinterpret_cast<float *>(s), sz, vs);
+		ApplySwizzleS(reinterpret_cast<float *>(s), sz);
 		
 		VectorSize outsize = V_Pair;
 		switch (sz) {
@@ -695,9 +704,9 @@ namespace MIPSInt
 			d[2] = ExpandHalf(s[1] & 0xFFFF);
 			d[3] = ExpandHalf(s[1] >> 16);
 			break;
-		case V_Triple:
-		case V_Quad:
+		default:
 			_dbg_assert_msg_(CPU, 0, "Trying to interpret Int_Vh2f instruction that can't be interpreted");
+			memset(d, 0, sizeof(d));
 			break;
 		}
 		ApplyPrefixD(d, outsize);
@@ -727,13 +736,14 @@ namespace MIPSInt
 			d[0] = ShrinkToHalf(s[0]) | ((u32)ShrinkToHalf(s[1]) << 16);
 			d[1] = ShrinkToHalf(s[2]) | ((u32)ShrinkToHalf(s[3]) << 16);
 			break;
-		case V_Single:
-		case V_Triple:
+		default:
 			_dbg_assert_msg_(CPU, 0, "Trying to interpret Int_Vf2h instruction that can't be interpreted");
+			d[0] = 0;
+			d[1] = 0;
 			break;
 		}
-		ApplyPrefixD((float*)&d[0], outsize);
-		WriteVector((float*)&d[0], outsize, vd);
+		ApplyPrefixD(reinterpret_cast<float *>(d), outsize);
+		WriteVector(reinterpret_cast<float *>(d), outsize, vd);
 		PC += 4;
 		EatPrefixes();
 	}
@@ -746,7 +756,7 @@ namespace MIPSInt
 		int vs = _VS;
 		VectorSize sz = GetVecSize(op);
 		VectorSize oz = sz;
-		ReadVector((float*)s, sz, vs);
+		ReadVector(reinterpret_cast<float *>(s), sz, vs);
 		// ForbidVPFXS
 
 		switch ((op >> 16) & 3) {
@@ -754,6 +764,8 @@ namespace MIPSInt
 			// Quad is the only option.
 			// This operation is weird. This particular way of working matches hw but does not 
 			// seem quite sane.
+			// I guess it's used for fixed-point math, and fills more bits to facilitate
+			// conversion between 8-bit and 16-bit values.  But then why not do it in vc2i?
 			{
 				u32 value = s[0];
 				u32 value2 = value / 2;
@@ -824,8 +836,8 @@ namespace MIPSInt
 			break;
 		}
 		
-		ApplyPrefixD((float*)d,oz, true);  // Only write mask
-		WriteVector((float*)d,oz,vd);
+		ApplyPrefixD(reinterpret_cast<float *>(d),oz, true);  // Only write mask
+		WriteVector(reinterpret_cast<float *>(d),oz,vd);
 		PC += 4;
 		EatPrefixes();
 	}
@@ -838,8 +850,8 @@ namespace MIPSInt
 		int vs = _VS;
 		VectorSize sz = GetVecSize(op);
 		VectorSize oz;
-		ReadVector((float*)s, sz, vs);
-		ApplySwizzleS((float*)s, sz); //TODO: and the mask to kill everything but swizzle
+		ReadVector(reinterpret_cast<float *>(s), sz, vs);
+		ApplySwizzleS(reinterpret_cast<float *>(s), sz); //TODO: and the mask to kill everything but swizzle
 		switch ((op >> 16)&3)
 		{
 		case 0: //vi2uc
@@ -911,8 +923,8 @@ namespace MIPSInt
 			oz = V_Single;
 			break;
 		}
-		ApplyPrefixD((float*)d,oz);
-		WriteVector((float*)d,oz,vd);
+		ApplyPrefixD(reinterpret_cast<float *>(d),oz);
+		WriteVector(reinterpret_cast<float *>(d),oz,vd);
 		PC += 4;
 		EatPrefixes();
 	}
@@ -923,7 +935,7 @@ namespace MIPSInt
 		int vs = _VS;
 		u32 s[4];
 		VectorSize sz = V_Quad;
-		ReadVector((float *)s, sz, vs);
+		ReadVector(reinterpret_cast<float *>(s), sz, vs);
 		u16 colors[4];
 		for (int i = 0; i < 4; i++)
 		{
@@ -1036,10 +1048,11 @@ namespace MIPSInt
 		}
 		else
 		{
-			for (int i = 0; i < n; i+=2)
-			{
-				d[i]   = s[i] + s[i+1];
-				d[i+1] = s[i] - s[i+1];
+			d[0] = s[0] + s[1];
+			d[1] = s[0] - s[1];
+			if (n == 4) {
+				d[2] = s[2] + s[3];
+				d[3] = s[2] - s[3];
 			}
 		}
 		ApplyPrefixD(d, sz);
@@ -1177,7 +1190,8 @@ namespace MIPSInt
 		ReadVector(s, sz, vs);
 		ApplySwizzleS(s, sz);
 		ReadVector(t, sz, vt);
-		// TODO: Does t have swizzle?
+		// TODO: The swizzle on t behaves oddly with constants, but sign changes seem to work.
+		// Also, seems to round in a non-standard way (sometimes toward zero, not always.)
 		d[0] = s[0] * t[1] - s[1] * t[0];
 		ApplyPrefixD(d, sz);
 		WriteVector(d, V_Single, vd);
@@ -1267,7 +1281,7 @@ namespace MIPSInt
 
 	void Int_VrndX(MIPSOpcode op)
 	{
-		float d[4];
+		FloatBits d;
 		int vd = _VD;
 		VectorSize sz = GetVecSize(op);
 		int n = GetNumVectorElements(sz);
@@ -1275,14 +1289,14 @@ namespace MIPSInt
 		{
 			switch ((op >> 16) & 0x1f)
 			{
-			case 1: d[i] = (float)currentMIPS->rng.R32(); break;  // vrndi - TODO: copy bits instead?
-			case 2: d[i] = 1.0f + ((float)currentMIPS->rng.R32() / 0xFFFFFFFF); break; // vrndf1   TODO: make more accurate
-			case 3: d[i] = 2.0f + 2 * ((float)currentMIPS->rng.R32() / 0xFFFFFFFF); break; // vrndf2   TODO: make more accurate
+			case 1: d.u[i] = currentMIPS->rng.R32(); break;  // vrndi
+			case 2: d.f[i] = 1.0f + ((float)currentMIPS->rng.R32() / 0xFFFFFFFF); break; // vrndf1   TODO: make more accurate
+			case 3: d.f[i] = 2.0f + 2 * ((float)currentMIPS->rng.R32() / 0xFFFFFFFF); break; // vrndf2   TODO: make more accurate
 			default: _dbg_assert_msg_(CPU,0,"Trying to interpret instruction that can't be interpreted");
 			}
 		}
-		ApplyPrefixD(d, sz);
-		WriteVector(d, sz, vd);
+		ApplyPrefixD(d.f, sz);
+		WriteVector(d.f, sz, vd);
 		PC += 4;
 		EatPrefixes();
 	}
@@ -1362,6 +1376,7 @@ namespace MIPSInt
 		{
 			Reporting::ReportMessage("Trying to interpret instruction that can't be interpreted (BADVTFM)");
 			_dbg_assert_msg_(CPU,0,"Trying to interpret instruction that can't be interpreted (BADVTFM)");
+			memset(d, 0, sizeof(d));
 		}
 		WriteVector(d, sz, vd);
 		PC += 4;
@@ -1530,12 +1545,6 @@ namespace MIPSInt
 		int cond = op&15;
 		VectorSize sz = GetVecSize(op);
 		int numElements = GetNumVectorElements(sz);
-
-		union FloatBits {
-			float f[4];
-			u32 u[4];
-			int i[4];
-		};
 
 		FloatBits s;
 		FloatBits t;
@@ -1785,6 +1794,8 @@ bad:
 		default:
 			Reporting::ReportMessage("CrossQuat instruction with wrong size");
 			_dbg_assert_msg_(CPU,0,"Trying to interpret instruction that can't be interpreted");
+			d[0] = 0;
+			d[1] = 0;
 			break;
 		}
 		WriteVector(d, sz, vd);
@@ -1809,11 +1820,6 @@ bad:
 		int vd = _VD;
 		int vs = _VS;
 		VectorSize sz = GetVecSize(op);
-
-		union FloatBits {
-			float f[4];
-			u32 u[4];
-		};
 
 		FloatBits d;
 		FloatBits s;
@@ -1855,11 +1861,6 @@ bad:
 		int vs = _VS;
 		int vt = _VT;
 		VectorSize sz = GetVecSize(op);
-
-		union FloatBits {
-			float f[4];
-			u32 u[4];
-		};
 
 		FloatBits d;
 		FloatBits s;

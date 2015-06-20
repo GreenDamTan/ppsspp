@@ -20,7 +20,7 @@
 #include "Core/Debugger/SymbolMap.h"
 #include "Core/Host.h"
 #include "Core/MIPS/MIPSAnalyst.h"
-#include "Core/MIPS/JitCommon/JitCommon.h"
+#include "Core/MIPS/JitCommon/NativeJit.h"
 #include "Core/CoreTiming.h"
 #include <cstdio>
 
@@ -102,13 +102,21 @@ void MemCheck::JitCleanup()
 
 size_t CBreakPoints::FindBreakpoint(u32 addr, bool matchTemp, bool temp)
 {
+	size_t found = INVALID_BREAKPOINT;
 	for (size_t i = 0; i < breakPoints_.size(); ++i)
 	{
-		if (breakPoints_[i].addr == addr && (!matchTemp || breakPoints_[i].temporary == temp))
-			return i;
+		const auto &bp = breakPoints_[i];
+		if (bp.addr == addr && (!matchTemp || bp.temporary == temp))
+		{
+			if (bp.enabled)
+				return i;
+			// Hold out until the first enabled one.
+			if (found == INVALID_BREAKPOINT)
+				found = i;
+		}
 	}
 
-	return INVALID_BREAKPOINT;
+	return found;
 }
 
 size_t CBreakPoints::FindMemCheck(u32 start, u32 end)
@@ -140,6 +148,18 @@ bool CBreakPoints::IsTempBreakPoint(u32 addr)
 {
 	size_t bp = FindBreakpoint(addr, true, true);
 	return bp != INVALID_BREAKPOINT;
+}
+
+bool CBreakPoints::RangeContainsBreakPoint(u32 addr, u32 size)
+{
+	const u32 end = addr + size;
+	for (const auto &bp : breakPoints_)
+	{
+		if (bp.addr >= addr && bp.addr < end)
+			return true;
+	}
+
+	return false;
 }
 
 void CBreakPoints::AddBreakPoint(u32 addr, bool temp)

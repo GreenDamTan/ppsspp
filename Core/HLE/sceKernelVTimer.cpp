@@ -17,7 +17,7 @@
 
 #include <algorithm>
 #include "Core/CoreTiming.h"
-#include "Core/MemMap.h"
+#include "Core/MemMapHelpers.h"
 #include "Core/Reporting.h"
 #include "Core/HLE/sceKernel.h"
 #include "Core/HLE/sceKernelInterrupt.h"
@@ -42,13 +42,13 @@ struct NativeVTimer {
 };
 
 struct VTimer : public KernelObject {
-	const char *GetName() {return nvt.name;}
-	const char *GetTypeName() {return "VTimer";}
+	const char *GetName() override { return nvt.name; }
+	const char *GetTypeName() override { return "VTimer"; }
 	static u32 GetMissingErrorCode() { return SCE_KERNEL_ERROR_UNKNOWN_VTID; }
 	static int GetStaticIDType() { return SCE_KERNEL_TMID_VTimer; }
-	int GetIDType() const { return SCE_KERNEL_TMID_VTimer; }
+	int GetIDType() const override { return SCE_KERNEL_TMID_VTimer; }
 
-	virtual void DoState(PointerWrap &p) {
+	void DoState(PointerWrap &p) override {
 		auto s = p.Section("VTimer", 1, 2);
 		if (!s)
 			return;
@@ -67,18 +67,18 @@ KernelObject *__KernelVTimerObject() {
 	return new VTimer;
 }
 
-u64 __getVTimerRunningTime(VTimer *vt) {
+static u64 __getVTimerRunningTime(VTimer *vt) {
 	if (vt->nvt.active == 0)
 		return 0;
 
 	return CoreTiming::GetGlobalTimeUs() - vt->nvt.base;
 }
 
-u64 __getVTimerCurrentTime(VTimer* vt) {
+static u64 __getVTimerCurrentTime(VTimer* vt) {
 	return vt->nvt.current + __getVTimerRunningTime(vt);
 }
 
-int __KernelCancelVTimer(SceUID id) {
+static int __KernelCancelVTimer(SceUID id) {
 	u32 error;
 	VTimer *vt = kernelObjects.Get<VTimer>(id, error);
 
@@ -90,7 +90,7 @@ int __KernelCancelVTimer(SceUID id) {
 	return 0;
 }
 
-void __KernelScheduleVTimer(VTimer *vt, u64 schedule) {
+static void __KernelScheduleVTimer(VTimer *vt, u64 schedule) {
 	CoreTiming::UnscheduleEvent(vtimerTimer, vt->GetUID());
 
 	vt->nvt.schedule = schedule;
@@ -99,30 +99,27 @@ void __KernelScheduleVTimer(VTimer *vt, u64 schedule) {
 		// The "real" base is base + current.  But when setting the time, base is important.
 		// The schedule is relative to those.
 		u64 cyclesIntoFuture;
-		// It seems like the minimum is approximately 200us?
-		if (schedule < __getVTimerCurrentTime(vt))
-			cyclesIntoFuture = usToCycles(200);
-		else {
-			u64 goalUs = vt->nvt.base + schedule - vt->nvt.current;
-			if (goalUs < CoreTiming::GetGlobalTimeUs())
-				cyclesIntoFuture = usToCycles(200);
-			else
-				cyclesIntoFuture = usToCycles(goalUs - CoreTiming::GetGlobalTimeUs());
+		if (schedule < 250) {
+			schedule = 250;
+		}
+		s64 goalUs = (u64)vt->nvt.base + schedule - (u64)vt->nvt.current;
+		s64 minGoalUs = CoreTiming::GetGlobalTimeUs() + 250;
+		if (goalUs < minGoalUs) {
+			cyclesIntoFuture = usToCycles(250);
+		} else {
+			cyclesIntoFuture = usToCycles(goalUs - CoreTiming::GetGlobalTimeUs());
 		}
 
 		CoreTiming::ScheduleEvent(cyclesIntoFuture, vtimerTimer, vt->GetUID());
 	}
 }
 
-void __rescheduleVTimer(SceUID id, u32 delay) {
+static void __rescheduleVTimer(SceUID id, u32 delay) {
 	u32 error;
 	VTimer *vt = kernelObjects.Get<VTimer>(id, error);
 
 	if (error)
 		return;
-
-	if (delay < 100)
-		delay = 100;
 
 	__KernelScheduleVTimer(vt, vt->nvt.schedule + delay);
 }
@@ -134,7 +131,7 @@ class VTimerIntrHandler : public IntrHandler
 public:
 	VTimerIntrHandler() : IntrHandler(PSP_SYSTIMER1_INTR) {}
 
-	virtual bool run(PendingInterrupt &pend) {
+	bool run(PendingInterrupt &pend) override {
 		u32 error;
 		SceUID vtimerID = vtimers.front();
 
@@ -161,7 +158,7 @@ public:
 		return true;
 	}
 
-	virtual void handleResult(PendingInterrupt &pend) {
+	void handleResult(PendingInterrupt &pend) override {
 		u32 result = currentMIPS->r[MIPS_REG_V0];
 
 		currentMIPS->r[MIPS_REG_SP] += HANDLER_STACK_SPACE;
@@ -178,7 +175,7 @@ public:
 	}
 };
 
-void __KernelTriggerVTimer(u64 userdata, int cyclesLate) {
+static void __KernelTriggerVTimer(u64 userdata, int cyclesLate) {
 	SceUID uid = (SceUID) userdata;
 
 	u32 error;
@@ -322,7 +319,7 @@ u64 sceKernelGetVTimerTimeWide(SceUID uid) {
 	return time;
 }
 
-u64 __KernelSetVTimer(VTimer *vt, u64 time) {
+static u64 __KernelSetVTimer(VTimer *vt, u64 time) {
 	u64 current = __getVTimerCurrentTime(vt);
 	vt->nvt.current = time - __getVTimerRunningTime(vt);
 
@@ -368,7 +365,7 @@ u64 sceKernelSetVTimerTimeWide(SceUID uid, u64 timeClock) {
 	return __KernelSetVTimer(vt, timeClock);
 }
 
-void __startVTimer(VTimer *vt) {
+static void __startVTimer(VTimer *vt) {
 	vt->nvt.active = 1;
 	vt->nvt.base = CoreTiming::GetGlobalTimeUs();
 
@@ -377,6 +374,8 @@ void __startVTimer(VTimer *vt) {
 }
 
 u32 sceKernelStartVTimer(SceUID uid) {
+	hleEatCycles(12200);
+
 	if (uid == runningVTimer) {
 		WARN_LOG(SCEKERNEL, "sceKernelStartVTimer(%08x): invalid vtimer", uid);
 		return SCE_KERNEL_ERROR_ILLEGAL_VTID;
@@ -398,7 +397,7 @@ u32 sceKernelStartVTimer(SceUID uid) {
 	return error;
 }
 
-void __stopVTimer(VTimer *vt) {
+static void __stopVTimer(VTimer *vt) {
 	// This increases (__getVTimerCurrentTime includes nvt.current.)
 	vt->nvt.current = __getVTimerCurrentTime(vt);
 	vt->nvt.active = 0;
@@ -427,6 +426,7 @@ u32 sceKernelStopVTimer(SceUID uid) {
 }
 
 u32 sceKernelSetVTimerHandler(SceUID uid, u32 scheduleAddr, u32 handlerFuncAddr, u32 commonAddr) {
+	hleEatCycles(900);
 	if (uid == runningVTimer) {
 		WARN_LOG(SCEKERNEL, "sceKernelSetVTimerHandler(%08x, %08x, %08x, %08x): invalid vtimer", uid, scheduleAddr, handlerFuncAddr, commonAddr);
 		return SCE_KERNEL_ERROR_ILLEGAL_VTID;
@@ -441,6 +441,7 @@ u32 sceKernelSetVTimerHandler(SceUID uid, u32 scheduleAddr, u32 handlerFuncAddr,
 	}
 
 	DEBUG_LOG(SCEKERNEL, "sceKernelSetVTimerHandler(%08x, %08x, %08x, %08x)", uid, scheduleAddr, handlerFuncAddr, commonAddr);
+	hleEatCycles(2000);
 
 	u64 schedule = Memory::Read_U64(scheduleAddr);
 	vt->nvt.handlerAddr = handlerFuncAddr;
@@ -455,6 +456,7 @@ u32 sceKernelSetVTimerHandler(SceUID uid, u32 scheduleAddr, u32 handlerFuncAddr,
 }
 
 u32 sceKernelSetVTimerHandlerWide(SceUID uid, u64 schedule, u32 handlerFuncAddr, u32 commonAddr) {
+	hleEatCycles(900);
 	if (uid == runningVTimer) {
 		WARN_LOG(SCEKERNEL, "sceKernelSetVTimerHandlerWide(%08x, %llu, %08x, %08x): invalid vtimer", uid, schedule, handlerFuncAddr, commonAddr);
 		return SCE_KERNEL_ERROR_ILLEGAL_VTID;

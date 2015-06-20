@@ -72,14 +72,14 @@ public:
 	}
 
 	// Quick accessors
-	ElfType GetType() { return (ElfType)(u16)(header->e_type); }
-	ElfMachine GetMachine() { return (ElfMachine)(u16)(header->e_machine); }
-	u32 GetEntryPoint() { return entryPoint; }
-	u32 GetFlags() { return (u32)(header->e_flags); }
+	ElfType GetType() const { return (ElfType)(u16)(header->e_type); }
+	ElfMachine GetMachine() const { return (ElfMachine)(u16)(header->e_machine); }
+	u32 GetEntryPoint() const { return entryPoint; }
+	u32 GetFlags() const { return (u32)(header->e_flags); }
 
 	int GetNumSegments() const { return (int)(header->e_phnum); }
 	int GetNumSections() const { return (int)(header->e_shnum); }
-	const char *GetSectionName(int section);
+	const char *GetSectionName(int section) const;
 	u8 *GetPtr(u32 offset) const {
 		return (u8*)base + offset;
 	}
@@ -100,7 +100,7 @@ public:
 	int GetSectionSize(SectionID section) const {
 		return sections[section].sh_size;
 	}
-	SectionID GetSectionByName(const char *name, int firstSection=0); //-1 for not found
+	SectionID GetSectionByName(const char *name, int firstSection=0) const; //-1 for not found
 
 	u32 GetSegmentPaddr(int segment) const {
 	    return segments[segment].p_paddr;
@@ -132,9 +132,10 @@ public:
 
 	u32 GetTotalTextSize() const;
 	u32 GetTotalDataSize() const;
+	u32 GetTotalSectionSizeByPrefix(const std::string &prefix) const;
 
 	// More indepth stuff:)
-	int LoadInto(u32 vaddr);
+	int LoadInto(u32 vaddr, bool fromTop);
 	bool LoadSymbols();
 	bool LoadRelocations(Elf32_Rel *rels, int numRelocs);
 	void LoadRelocations2(int rel_seg);

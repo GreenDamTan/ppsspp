@@ -49,7 +49,7 @@
 #include "Core/SaveState.h"
 #include "Core/System.h"
 #include "Core/Config.h"
-#include "Core/MIPS/JitCommon/JitCommon.h"
+#include "Core/MIPS/JitCommon/NativeJit.h"
 #include "Core/MIPS/JitCommon/JitBlockCache.h"
 #include "Core/FileSystems/MetaFileSystem.h"
 #include "Windows/EmuThread.h"
@@ -71,7 +71,6 @@
 #include "GPU/GLES/TextureScaler.h"
 #include "GPU/GLES/TextureCache.h"
 #include "GPU/GLES/Framebuffer.h"
-#include "ControlMapping.h"
 #include "UI/OnScreenDisplay.h"
 #include "GPU/Common/PostShader.h"
 
@@ -135,6 +134,7 @@ namespace MainWindow
 	static W32Util::AsyncBrowseDialog *browseDialog;
 	static bool browsePauseAfter;
 	static bool g_inModeSwitch; // when true, don't react to WM_SIZE
+	static int g_WindowState;
 
 #define MAX_LOADSTRING 100
 	const TCHAR *szTitle = TEXT("PPSSPP");
@@ -230,16 +230,32 @@ namespace MainWindow
 	static void UpdateRenderResolution() {
 		RECT rc;
 		GetClientRect(hwndMain, &rc);
+
+		// Actually, auto mode should be more granular...
 		// Round up to a zoom factor for the render size.
 		int zoom = g_Config.iInternalResolution;
-		if (zoom == 0) // auto mode
-			zoom = (rc.right - rc.left + 479) / 480;
+		if (zoom == 0) { // auto mode
+			// Use the longest dimension
+			if (g_Config.IsPortrait()) {
+				zoom = (rc.bottom - rc.top + 479) / 480;
+			} else {
+				zoom = (rc.right - rc.left + 479) / 480;
+			}
+		}
 		if (zoom <= 1)
 			zoom = 1;
 
-		// Actually, auto mode should be more granular...
-		PSP_CoreParameter().renderWidth = 480 * zoom;
-		PSP_CoreParameter().renderHeight = 272 * zoom;
+		if (g_Config.IsPortrait()) {
+			PSP_CoreParameter().renderWidth = 272 * zoom;
+			PSP_CoreParameter().renderHeight = 480 * zoom;
+		} else {
+			PSP_CoreParameter().renderWidth = 480 * zoom;
+			PSP_CoreParameter().renderHeight = 272 * zoom;
+		}
+	}
+
+	static bool IsWindowSmall() {
+		return g_Config.IsPortrait() ? (g_Config.iWindowHeight < 480 + 80) : (g_Config.iWindowWidth < 480 + 80);
 	}
 
 	static void ResizeDisplay(bool noWindowMovement = false) {
@@ -250,7 +266,7 @@ namespace MainWindow
 		if (!noWindowMovement) {
 			width = rc.right - rc.left;
 			height = rc.bottom - rc.top;
-			// Moves the internal window, not the frame. TODO: Get rid of the internal window.
+			// Moves the internal window, not the frame. TODO: Get rid of the internal window. Tried before but Intel drivers screw up when minimizing, or something?
 			MoveWindow(hwndDisplay, 0, 0, width, height, TRUE);
 			// This is taken care of anyway later, but makes sure that ShowScreenResolution gets the right numbers.
 			// Need to clean all of this up...
@@ -261,15 +277,22 @@ namespace MainWindow
 		UpdateRenderResolution();
 		
 		if (!noWindowMovement) {
-			UpdateScreenScale(width, height);
-			NativeMessageReceived("gpu resized", "");
+			if (UpdateScreenScale(width, height, IsWindowSmall())) {
+				NativeMessageReceived("gpu resized", "");
+			}
 		}
 	}
 
 	void SetWindowSize(int zoom) {
 		AssertCurrentThreadName("Main");
 		RECT rc, rcOuter;
-		GetWindowRectAtResolution(480 * (int)zoom, 272 * (int)zoom, rc, rcOuter);
+
+		// Actually, auto mode should be more granular...
+		if (g_Config.IsPortrait()) {
+			GetWindowRectAtResolution(272 * (int)zoom, 480 * (int)zoom, rc, rcOuter);
+		} else {
+			GetWindowRectAtResolution(480 * (int)zoom, 272 * (int)zoom, rc, rcOuter);
+		}
 		MoveWindow(hwndMain, rcOuter.left, rcOuter.top, rcOuter.right - rcOuter.left, rcOuter.bottom - rcOuter.top, TRUE);
 		ResizeDisplay(false);
 		ShowScreenResolution();
@@ -309,7 +332,7 @@ namespace MainWindow
 		}
 	}
 
-	void ToggleFullscreen(HWND hWnd, bool goingFullscreen = false) {
+	void ToggleFullscreen(HWND hWnd, bool goingFullscreen) {
 		// Make sure no rendering is happening during the switch.
 		Core_NotifyWindowHidden(true);
 		g_inModeSwitch = true;  // Make sure WM_SIZE doesn't call Core_NotifyWindowHidden(false)...
@@ -328,6 +351,11 @@ namespace MainWindow
 			// Put back the menu bar.
 			::SetMenu(hWnd, menu);
 		} else {
+			// If the window was maximized before going fullscreen, make sure to restore first
+			// in order not to have the taskbar show up on top of PPSSPP.
+			if (g_WindowState == SIZE_MAXIMIZED) {
+				ShowWindow(hwndMain, SW_RESTORE);
+			}
 			// Remember the normal window rectangle.
 			::GetWindowRect(hWnd, &g_normalRC);
 
@@ -345,7 +373,12 @@ namespace MainWindow
 		::SetMenu(hWnd, goingFullscreen ? NULL : menu);
 
 		// Resize to the appropriate view.
-		ShowWindow(hwndMain, goingFullscreen ? SW_MAXIMIZE : SW_RESTORE);
+		// If we're returning to window mode, re-apply the appropriate size setting.
+		if (goingFullscreen) {
+			ShowWindow(hwndMain, SW_MAXIMIZE);
+		} else {
+			ShowWindow(hwndMain, g_WindowState == SIZE_MAXIMIZED ? SW_MAXIMIZE : SW_RESTORE);
+		}
 
 		g_Config.bFullScreen = goingFullscreen;
 		CorrectCursor();
@@ -360,6 +393,7 @@ namespace MainWindow
 
 		g_inModeSwitch = false;
 		Core_NotifyWindowHidden(false);
+		WindowsRawInput::NotifyMenu();
 	}
 
 	RECT DetermineWindowRectangle() {
@@ -390,7 +424,8 @@ namespace MainWindow
 		// First, get the w/h right.
 		if (g_Config.iWindowWidth <= 0 || g_Config.iWindowHeight <= 0) {
 			RECT rcInner = rc, rcOuter;
-			GetWindowRectAtResolution(2 * 480, 2 * 272, rcInner, rcOuter);
+			bool portrait = g_Config.IsPortrait();
+			GetWindowRectAtResolution(2 * (portrait ? 272 : 480), 2 * (portrait ? 480 : 272), rcInner, rcOuter);
 			rc.right = rc.left + (rcOuter.right - rcOuter.left);
 			rc.bottom = rc.top + (rcOuter.bottom - rcOuter.top);
 			g_Config.iWindowWidth = rc.right - rc.left;
@@ -454,10 +489,12 @@ namespace MainWindow
 		SUBMENU_CUSTOM_SHADERS = 10,
 		SUBMENU_RENDERING_RESOLUTION = 11,
 		SUBMENU_WINDOW_SIZE = 12,
-		SUBMENU_RENDERING_MODE = 13,
-		SUBMENU_FRAME_SKIPPING = 14,
-		SUBMENU_TEXTURE_FILTERING = 15,
-		SUBMENU_TEXTURE_SCALING = 16,
+		SUBMENU_RENDERING_BACKEND = 13,
+		SUBMENU_RENDERING_MODE = 14,
+		SUBMENU_FRAME_SKIPPING = 15,
+		SUBMENU_TEXTURE_FILTERING = 16,
+		SUBMENU_BUFFER_FILTER = 17,
+		SUBMENU_TEXTURE_SCALING = 18,
 	};
 
 	std::string GetMenuItemText(int menuID) {
@@ -504,10 +541,6 @@ namespace MainWindow
 		AppendMenu(helpMenu, MF_STRING | MF_BYCOMMAND, ID_HELP_OPENWEBSITE, visitMainWebsite.c_str());
 		AppendMenu(helpMenu, MF_STRING | MF_BYCOMMAND, ID_HELP_OPENFORUM, visitForum.c_str());
 		// Repeat the process for other languages, if necessary.
-		if(g_Config.sLanguageIni == "zh_CN" || g_Config.sLanguageIni == "zh_TW") {
-			const std::wstring visitChineseForum = ConvertUTF8ToWString(des->T("PPSSPP Chinese Forum"));
-			AppendMenu(helpMenu, MF_STRING | MF_BYCOMMAND, ID_HELP_CHINESE_FORUM, visitChineseForum.c_str());
-		}
 		AppendMenu(helpMenu, MF_STRING | MF_BYCOMMAND, ID_HELP_BUYGOLD, buyGold.c_str());
 		AppendMenu(helpMenu, MF_SEPARATOR, 0, 0);
 		AppendMenu(helpMenu, MF_STRING | MF_BYCOMMAND, ID_HELP_ABOUT, aboutPPSSPP.c_str());
@@ -641,6 +674,9 @@ namespace MainWindow
 		// Skip rendering resolution 2x-5x..
 		TranslateSubMenu("Window Size", MENU_OPTIONS, SUBMENU_WINDOW_SIZE);
 		// Skip window size 1x-4x..
+		TranslateSubMenu("Backend", MENU_OPTIONS, SUBMENU_RENDERING_BACKEND);
+		TranslateMenuItem(ID_OPTIONS_DIRECTX);
+		TranslateMenuItem(ID_OPTIONS_OPENGL);
 		TranslateSubMenu("Rendering Mode", MENU_OPTIONS, SUBMENU_RENDERING_MODE, L"\tF5");
 		TranslateMenuItem(ID_OPTIONS_NONBUFFEREDRENDERING);
 		TranslateMenuItem(ID_OPTIONS_BUFFEREDRENDERING);
@@ -655,6 +691,9 @@ namespace MainWindow
 		TranslateMenuItem(ID_OPTIONS_NEARESTFILTERING);
 		TranslateMenuItem(ID_OPTIONS_LINEARFILTERING);
 		TranslateMenuItem(ID_OPTIONS_LINEARFILTERING_CG);
+		TranslateSubMenu("Screen Scaling Filter", MENU_OPTIONS, SUBMENU_BUFFER_FILTER);
+		TranslateMenuItem(ID_OPTIONS_BUFLINEARFILTER);
+		TranslateMenuItem(ID_OPTIONS_BUFNEARESTFILTER);
 		TranslateSubMenu("Texture Scaling", MENU_OPTIONS, SUBMENU_TEXTURE_SCALING);
 		TranslateMenuItem(ID_TEXTURESCALING_OFF);
 		// Skip texture scaling 2x-5x...
@@ -689,6 +728,10 @@ namespace MainWindow
 		g_Config.iTexFiltering = type;
 	}
 
+	void setBufFilter(int type) {
+		g_Config.iBufFilter = type;
+	}
+
 	void setTexScalingType(int type) {
 		g_Config.iTexScalingType = type;
 		NativeMessageReceived("gpu clear cache", "");
@@ -707,6 +750,7 @@ namespace MainWindow
 		switch(g_Config.iRenderingMode) {
 		case FB_NON_BUFFERED_MODE:
 			osm.Show(g->T("Non-Buffered Rendering"));
+			g_Config.bAutoFrameSkip = false;
 			break;
 
 		case FB_BUFFERED_MODE:
@@ -714,11 +758,11 @@ namespace MainWindow
 			break;
 
 		case FB_READFBOMEMORY_CPU:
-			osm.Show(g->T("Read Framebuffer to Memory (CPU)"));
+			osm.Show(g->T("Read Framebuffers To Memory (CPU)"));
 			break;
 
 		case FB_READFBOMEMORY_GPU:
-			osm.Show(g->T("Read Framebuffer to Memory (GPU)"));
+			osm.Show(g->T("Read Framebuffers To Memory (GPU)"));
 			break;
 		}
 
@@ -919,9 +963,8 @@ namespace MainWindow
 
 	LRESULT CALLBACK DisplayProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
 		// Only apply a factor > 1 in windowed mode.
-		int factor = !IsZoomed(GetHWND()) && !g_Config.bFullScreen && g_Config.iWindowWidth < (480 + 80) ? 2 : 1;
+		int factor = !IsZoomed(GetHWND()) && !g_Config.bFullScreen && IsWindowSmall() ? 2 : 1;
 		static bool firstErase = true;
-
 
 		switch (message) {
 		case WM_ACTIVATE:
@@ -1049,8 +1092,9 @@ namespace MainWindow
 			{
 				MINMAXINFO *minmax = reinterpret_cast<MINMAXINFO *>(lParam);
 				RECT rc = { 0 };
-				rc.right = 480;
-				rc.bottom = 272;
+				bool portrait = g_Config.IsPortrait();
+				rc.right = portrait ? 272 : 480;
+				rc.bottom = portrait ? 480 : 272;
 				AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, TRUE);
 				minmax->ptMinTrackSize.x = rc.right - rc.left;
 				minmax->ptMinTrackSize.y = rc.bottom - rc.top;
@@ -1061,6 +1105,8 @@ namespace MainWindow
 			{
 				bool pause = true;
 				if (wParam == WA_ACTIVE || wParam == WA_CLICKACTIVE) {
+					WindowsRawInput::GainFocus();
+					InputDevice::GainFocus();
 					g_activeWindow = WINDOW_MAINWINDOW;
 					pause = false;
 				}
@@ -1073,8 +1119,13 @@ namespace MainWindow
 					}
 				}
 
+				if (wParam == WA_ACTIVE) {
+					NativeMessageReceived("got_focus", "");
+				}
 				if (wParam == WA_INACTIVE) {
+					NativeMessageReceived("lost_focus", "");
 					WindowsRawInput::LoseFocus();
+					InputDevice::LoseFocus();
 				}
 			}
 			break;
@@ -1098,6 +1149,7 @@ namespace MainWindow
 					}
 					SavePosition();
 					ResizeDisplay();
+					g_WindowState = wParam;
 					break;
 				case SIZE_MINIMIZED:
 					Core_NotifyWindowHidden(true);
@@ -1109,6 +1161,7 @@ namespace MainWindow
 					break;
 				}
 			}
+			break;
 
     case WM_TIMER:
 			// Hack: Take the opportunity to also show/hide the mouse cursor in fullscreen mode.
@@ -1167,7 +1220,7 @@ namespace MainWindow
 					break;
 
 				case ID_FILE_MEMSTICK:
-					ShellExecute(NULL, L"open", ConvertUTF8ToWString(g_Config.memCardDirectory).c_str(), 0, 0, SW_SHOW);
+					ShellExecute(NULL, L"open", ConvertUTF8ToWString(g_Config.memStickDirectory).c_str(), 0, 0, SW_SHOW);
 					break;
 
 				case ID_TOGGLE_PAUSE:
@@ -1238,7 +1291,7 @@ namespace MainWindow
 
 				case ID_FILE_SAVESTATE_NEXT_SLOT_HC:
 				{
-					if (KeyMap::g_controllerMap[VIRTKEY_NEXT_SLOT].begin() == KeyMap::g_controllerMap[VIRTKEY_NEXT_SLOT].end())
+					if (KeyMap::g_controllerMap[VIRTKEY_NEXT_SLOT].empty())
 					{ 
 						SaveState::NextSlot();
 					}
@@ -1260,7 +1313,7 @@ namespace MainWindow
 
 				case ID_FILE_QUICKLOADSTATE_HC:
 				{
-					if (KeyMap::g_controllerMap[VIRTKEY_LOAD_STATE].begin() == KeyMap::g_controllerMap[VIRTKEY_LOAD_STATE].end())
+					if (KeyMap::g_controllerMap[VIRTKEY_LOAD_STATE].empty())
 					{
 						SetCursor(LoadCursor(0, IDC_WAIT));
 						SaveState::LoadSlot(g_Config.iCurrentStateSlot, SaveStateActionFinished);
@@ -1276,7 +1329,7 @@ namespace MainWindow
 
 				case ID_FILE_QUICKSAVESTATE_HC:
 				{
-					if (KeyMap::g_controllerMap[VIRTKEY_SAVE_STATE].begin() == KeyMap::g_controllerMap[VIRTKEY_SAVE_STATE].end())
+					if (KeyMap::g_controllerMap[VIRTKEY_SAVE_STATE].empty())
 					{
 						SetCursor(LoadCursor(0, IDC_WAIT));
 						SaveState::SaveSlot(g_Config.iCurrentStateSlot, SaveStateActionFinished);
@@ -1321,6 +1374,8 @@ namespace MainWindow
 
 				case ID_OPTIONS_FRAMESKIP_AUTO:
 					g_Config.bAutoFrameSkip = !g_Config.bAutoFrameSkip;
+					if (g_Config.bAutoFrameSkip && g_Config.iRenderingMode == FB_NON_BUFFERED_MODE)
+						g_Config.iRenderingMode = FB_BUFFERED_MODE;
 					break;
 
 				case ID_TEXTURESCALING_AUTO: setTexScalingMultiplier(TEXSCALING_AUTO); break;
@@ -1338,6 +1393,18 @@ namespace MainWindow
 				case ID_TEXTURESCALING_DEPOSTERIZE:
 					g_Config.bTexDeposterize = !g_Config.bTexDeposterize;
 					NativeMessageReceived("gpu clear cache", "");
+					break;
+
+				case ID_OPTIONS_DIRECTX:
+					g_Config.iTempGPUBackend = GPU_BACKEND_DIRECT3D9;
+					g_Config.bRestartRequired = true;
+					PostMessage(MainWindow::GetHWND(), WM_CLOSE, 0, 0);
+					break;
+
+				case ID_OPTIONS_OPENGL:
+					g_Config.iTempGPUBackend = GPU_BACKEND_OPENGL;
+					g_Config.bRestartRequired = true;
+					PostMessage(MainWindow::GetHWND(), WM_CLOSE, 0, 0);
 					break;
 
 				case ID_OPTIONS_NONBUFFEREDRENDERING:   setRenderingMode(FB_NON_BUFFERED_MODE); break;
@@ -1493,10 +1560,7 @@ namespace MainWindow
 					break;
 
 				case ID_OPTIONS_FULLSCREEN:
-					g_Config.bFullScreen = !g_Config.bFullScreen;
-
-					ToggleFullscreen(hwndMain, g_Config.bFullScreen);
-
+					PostMessage(hWnd, WM_USER_TOGGLE_FULLSCREEN, 0, 0);
 					break;
 
 				case ID_OPTIONS_VERTEXCACHE:
@@ -1511,6 +1575,9 @@ namespace MainWindow
 				case ID_OPTIONS_NEARESTFILTERING:      setTexFiltering(NEAREST); break;
 				case ID_OPTIONS_LINEARFILTERING:       setTexFiltering(LINEAR); break;
 				case ID_OPTIONS_LINEARFILTERING_CG:    setTexFiltering(LINEARFMV); break;
+
+				case ID_OPTIONS_BUFLINEARFILTER:       setBufFilter(SCALE_LINEAR); break;
+				case ID_OPTIONS_BUFNEARESTFILTER:      setBufFilter(SCALE_NEAREST); break;
 
 				case ID_OPTIONS_TOPMOST:
 					g_Config.bTopMost = !g_Config.bTopMost;
@@ -1549,10 +1616,6 @@ namespace MainWindow
 					ShellExecute(NULL, L"open", L"http://forums.ppsspp.org/", NULL, NULL, SW_SHOWNORMAL);
 					break;
 
-				case ID_HELP_CHINESE_FORUM:
-					ShellExecute(NULL, L"open", L"http://tieba.baidu.com/f?ie=utf-8&kw=ppsspp", NULL, NULL, SW_SHOWNORMAL);
-					break;
-
 				case ID_HELP_ABOUT:
 					DialogManager::EnableAll(FALSE);
 					DialogBox(hInst, (LPCTSTR)IDD_ABOUTBOX, hWnd, (DLGPROC)About);
@@ -1582,6 +1645,10 @@ namespace MainWindow
 					break;
 				}
 			}
+			break;
+
+		case WM_USER_TOGGLE_FULLSCREEN:
+			ToggleFullscreen(hwndMain, !g_Config.bFullScreen);
 			break;
 
 		case WM_INPUT:
@@ -1778,8 +1845,11 @@ namespace MainWindow
 		RECT rc;
 		GetClientRect(GetHWND(), &rc);
 
+		int checkW = g_Config.IsPortrait() ? 272 : 480;
+		int checkH = g_Config.IsPortrait() ? 480 : 272;
+
 		for (int i = 0; i < ARRAY_SIZE(windowSizeItems); i++) {
-			bool check = (i + 1) * 480 == rc.right - rc.left || (i + 1) * 272 == rc.bottom - rc.top;
+			bool check = (i + 1) * checkW == rc.right - rc.left || (i + 1) * checkH == rc.bottom - rc.top;
 			CheckMenuItem(menu, windowSizeItems[i], MF_BYCOMMAND | (check ? MF_CHECKED : MF_UNCHECKED));
 		}
 
@@ -1841,6 +1911,20 @@ namespace MainWindow
 			CheckMenuItem(menu, texfilteringitems[i], MF_BYCOMMAND | ((i + 1) == g_Config.iTexFiltering ? MF_CHECKED : MF_UNCHECKED));
 		}
 
+		static const int bufferfilteritems[] = {
+			ID_OPTIONS_BUFLINEARFILTER,
+			ID_OPTIONS_BUFNEARESTFILTER,
+		};
+		if (g_Config.iBufFilter < SCALE_LINEAR)
+			g_Config.iBufFilter = SCALE_LINEAR;
+
+		else if (g_Config.iBufFilter > SCALE_NEAREST)
+			g_Config.iBufFilter = SCALE_NEAREST;
+
+		for (int i = 0; i < ARRAY_SIZE(bufferfilteritems); i++) {
+			CheckMenuItem(menu, bufferfilteritems[i], MF_BYCOMMAND | ((i + 1) == g_Config.iBufFilter ? MF_CHECKED : MF_UNCHECKED));
+		}
+
 		static const int renderingmode[] = {
 			ID_OPTIONS_NONBUFFEREDRENDERING,
 			ID_OPTIONS_BUFFEREDRENDERING,
@@ -1895,6 +1979,17 @@ namespace MainWindow
 		for (int i = 0; i < ARRAY_SIZE(savestateSlot); i++) {
 			CheckMenuItem(menu, savestateSlot[i], MF_BYCOMMAND | (( i == g_Config.iCurrentStateSlot )? MF_CHECKED : MF_UNCHECKED));
 		}
+
+		if (g_Config.iGPUBackend == GPU_BACKEND_DIRECT3D9) {
+			EnableMenuItem(menu, ID_OPTIONS_DIRECTX, MF_GRAYED);
+			CheckMenuItem(menu, ID_OPTIONS_DIRECTX, MF_CHECKED);
+			EnableMenuItem(menu, ID_OPTIONS_OPENGL, MF_ENABLED);
+		} else {
+			EnableMenuItem(menu, ID_OPTIONS_OPENGL, MF_GRAYED);
+			CheckMenuItem(menu, ID_OPTIONS_OPENGL, MF_CHECKED);
+			EnableMenuItem(menu, ID_OPTIONS_DIRECTX, MF_ENABLED);
+		}
+
 
 		UpdateDynamicMenuCheckmarks();
 		UpdateCommands();

@@ -17,9 +17,7 @@
 
 #ifdef _WIN32
 #include "Common/CommonWindows.h"
-#ifndef _XBOX
 #include <ShlObj.h>
-#endif
 #include <string>
 #include <codecvt>
 #endif
@@ -35,11 +33,9 @@
 
 #include "Core/MIPS/MIPS.h"
 #include "Core/MIPS/MIPSAnalyst.h"
-#include "Core/MIPS/JitCommon/JitCommon.h"
 
 #include "Core/Host.h"
 #include "Core/System.h"
-#include "Core/PSPMixer.h"
 #include "Core/HLE/HLE.h"
 #include "Core/HLE/ReplaceTables.h"
 #include "Core/HLE/sceKernel.h"
@@ -66,21 +62,24 @@ enum CPUThreadState {
 	CPU_THREAD_STARTING,
 	CPU_THREAD_RUNNING,
 	CPU_THREAD_SHUTDOWN,
+	CPU_THREAD_QUIT,
 
 	CPU_THREAD_EXECUTE,
+	CPU_THREAD_RESUME,
 };
 
 MetaFileSystem pspFileSystem;
 ParamSFOData g_paramSFO;
 static GlobalUIState globalUIState;
 static CoreParameter coreParameter;
-static PSPMixer *mixer;
-static std::thread *cpuThread = NULL;
+static FileLoader *loadedFile;
+static std::thread *cpuThread = nullptr;
 static std::thread::id cpuThreadID;
 static recursive_mutex cpuThreadLock;
 static condition_variable cpuThreadCond;
 static condition_variable cpuThreadReplyCond;
 static u64 cpuThreadUntil;
+bool audioInitialized;
 
 // This can be read and written from ANYWHERE.
 volatile CoreState coreState = CORE_STEPPING;
@@ -101,18 +100,18 @@ GlobalUIState GetUIState() {
 }
 
 bool IsAudioInitialised() {
-	return mixer != NULL;
+	return audioInitialized;
 }
 
 void Audio_Init() {
-	if (mixer == NULL) {
-		mixer = new PSPMixer();
-		host->InitSound(mixer);
+	if (!audioInitialized) {
+		audioInitialized = true;
+		host->InitSound();
 	}
 }
 
 bool IsOnSeparateCPUThread() {
-	if (cpuThread != NULL) {
+	if (cpuThread != nullptr) {
 		return cpuThreadID == std::this_thread::get_id();
 	} else {
 		return false;
@@ -183,7 +182,13 @@ void CPU_Init() {
 	Memory::g_PSPModel = g_Config.iPSPModel;
 
 	std::string filename = coreParameter.fileToStart;
-	IdentifiedFileType type = Identify_File(filename);
+	loadedFile = ConstructFileLoader(filename);
+	IdentifiedFileType type = Identify_File(loadedFile);
+
+	// TODO: Put this somewhere better?
+	if (coreParameter.mountIso != "") {
+		coreParameter.mountIsoLoader = ConstructFileLoader(coreParameter.mountIso);
+	}
 
 	MIPSAnalyst::Reset();
 	Replacement_Init();
@@ -192,7 +197,7 @@ void CPU_Init() {
 	case FILETYPE_PSP_ISO:
 	case FILETYPE_PSP_ISO_NP:
 	case FILETYPE_PSP_DISC_DIRECTORY:
-		InitMemoryForGameISO(filename);
+		InitMemoryForGameISO(loadedFile);
 		break;
 	default:
 		break;
@@ -215,7 +220,7 @@ void CPU_Init() {
 	// TODO: Check Game INI here for settings, patches and cheats, and modify coreParameter accordingly
 
 	// Why did we check for CORE_POWERDOWN here?
-	if (!LoadFile(filename, &coreParameter.errorString)) {
+	if (!LoadFile(&loadedFile, &coreParameter.errorString)) {
 		CPU_Shutdown();
 		coreParameter.fileToStart = "";
 		CPU_SetState(CPU_THREAD_NOT_RUNNING);
@@ -242,24 +247,36 @@ void CPU_Shutdown() {
 	HLEShutdown();
 	if (coreParameter.enableSound) {
 		host->ShutdownSound();
-		mixer = 0;  // deleted in ShutdownSound
+		audioInitialized = false;  // deleted in ShutdownSound
 	}
 	pspFileSystem.Shutdown();
 	mipsr4k.Shutdown();
 	Memory::Shutdown();
+
+	delete loadedFile;
+	loadedFile = nullptr;
+
+	delete coreParameter.mountIsoLoader;
+	coreParameter.mountIsoLoader = nullptr;
+}
+
+// TODO: Maybe loadedFile doesn't even belong here...
+void UpdateLoadedFile(FileLoader *fileLoader) {
+	delete loadedFile;
+	loadedFile = fileLoader;
 }
 
 void CPU_RunLoop() {
 	setCurrentThreadName("CPU");
 	FPU_SetFastMode();
 
-	if (!CPU_NextState(CPU_THREAD_PENDING, CPU_THREAD_STARTING)) {
+	if (CPU_NextState(CPU_THREAD_PENDING, CPU_THREAD_STARTING)) {
+		CPU_Init();
+		CPU_NextState(CPU_THREAD_STARTING, CPU_THREAD_RUNNING);
+	} else if (!CPU_NextState(CPU_THREAD_RESUME, CPU_THREAD_RUNNING)) {
 		ERROR_LOG(CPU, "CPU thread in unexpected state: %d", cpuThreadState);
 		return;
 	}
-
-	CPU_Init();
-	CPU_NextState(CPU_THREAD_STARTING, CPU_THREAD_RUNNING);
 
 	while (cpuThreadState != CPU_THREAD_SHUTDOWN)
 	{
@@ -275,6 +292,11 @@ void CPU_RunLoop() {
 		case CPU_THREAD_RUNNING:
 		case CPU_THREAD_SHUTDOWN:
 			break;
+
+		case CPU_THREAD_QUIT:
+			// Just leave the thread, CPU is switching off thread.
+			CPU_SetState(CPU_THREAD_NOT_RUNNING);
+			return;
 
 		default:
 			ERROR_LOG(CPU, "CPU thread in unexpected state: %d", cpuThreadState);
@@ -337,11 +359,6 @@ bool PSP_InitStart(const CoreParameter &coreParam, std::string *error_string) {
 		Core_ListenShutdown(System_Wake);
 		CPU_SetState(CPU_THREAD_PENDING);
 		cpuThread = new std::thread(&CPU_RunLoop);
-#ifdef _XBOX
-		SuspendThread(cpuThread->native_handle());
-		XSetThreadProcessor(cpuThread->native_handle(), 2);
-		ResumeThread(cpuThread->native_handle());
-#endif
 		cpuThreadID = cpuThread->get_id();
 		cpuThread->detach();
 	} else {
@@ -415,7 +432,7 @@ void PSP_Shutdown() {
 	if (coreState == CORE_RUNNING)
 		Core_UpdateState(CORE_ERROR);
 	Core_NotifyShutdown();
-	if (cpuThread != NULL) {
+	if (cpuThread != nullptr) {
 		CPU_NextStateNot(CPU_THREAD_NOT_RUNNING, CPU_THREAD_SHUTDOWN);
 		CPU_WaitStatus(cpuThreadReplyCond, &CPU_IsShutdown);
 		delete cpuThread;
@@ -425,11 +442,13 @@ void PSP_Shutdown() {
 		CPU_Shutdown();
 	}
 	GPU_Shutdown();
+	g_paramSFO.Clear();
 	host->SetWindowTitle(0);
 	currentMIPS = 0;
 	pspIsInited = false;
 	pspIsIniting = false;
 	pspIsQuiting = false;
+	g_Config.unloadGameConfig();
 }
 
 void PSP_RunLoopUntil(u64 globalticks) {
@@ -438,7 +457,31 @@ void PSP_RunLoopUntil(u64 globalticks) {
 		return;
 	}
 
-	if (cpuThread != NULL) {
+	// Switch the CPU thread on or off, as the case may be.
+	bool useCPUThread = g_Config.bSeparateCPUThread;
+	if (useCPUThread && cpuThread == nullptr) {
+		// Need to start the cpu thread.
+		Core_ListenShutdown(System_Wake);
+		CPU_SetState(CPU_THREAD_RESUME);
+		cpuThread = new std::thread(&CPU_RunLoop);
+		cpuThreadID = cpuThread->get_id();
+		cpuThread->detach();
+		if (gpu) {
+			gpu->SetThreadEnabled(true);
+		}
+		CPU_WaitStatus(cpuThreadReplyCond, &CPU_IsReady);
+	} else if (!useCPUThread && cpuThread != nullptr) {
+		CPU_SetState(CPU_THREAD_QUIT);
+		CPU_WaitStatus(cpuThreadReplyCond, &CPU_IsShutdown);
+		delete cpuThread;
+		cpuThread = nullptr;
+		cpuThreadID = std::thread::id();
+		if (gpu) {
+			gpu->SetThreadEnabled(false);
+		}
+	}
+
+	if (cpuThread != nullptr) {
 		// Tell the gpu a new frame is about to begin, before we start the CPU.
 		gpu->SyncBeginFrame();
 
@@ -473,30 +516,32 @@ CoreParameter &PSP_CoreParameter() {
 std::string GetSysDirectory(PSPDirectories directoryType) {
 	switch (directoryType) {
 	case DIRECTORY_CHEATS:
-		return g_Config.memCardDirectory + "PSP/Cheats/";
+		return g_Config.memStickDirectory + "PSP/Cheats/";
 	case DIRECTORY_GAME:
-		return g_Config.memCardDirectory + "PSP/GAME/";
+		return g_Config.memStickDirectory + "PSP/GAME/";
 	case DIRECTORY_SAVEDATA:
-		return g_Config.memCardDirectory + "PSP/SAVEDATA/";
+		return g_Config.memStickDirectory + "PSP/SAVEDATA/";
 	case DIRECTORY_SCREENSHOT:
-		return g_Config.memCardDirectory + "PSP/SCREENSHOT/";
+		return g_Config.memStickDirectory + "PSP/SCREENSHOT/";
 	case DIRECTORY_SYSTEM:
-		return g_Config.memCardDirectory + "PSP/SYSTEM/";
+		return g_Config.memStickDirectory + "PSP/SYSTEM/";
 	case DIRECTORY_PAUTH:
-		return g_Config.memCardDirectory + "PAUTH/";
+		return g_Config.memStickDirectory + "PAUTH/";
 	case DIRECTORY_DUMP:
-		return g_Config.memCardDirectory + "PSP/SYSTEM/DUMP/";
+		return g_Config.memStickDirectory + "PSP/SYSTEM/DUMP/";
+	case DIRECTORY_SAVESTATE:
+		return g_Config.memStickDirectory + "PSP/PPSSPP_STATE/";
 	// Just return the memory stick root if we run into some sort of problem.
 	default:
 		ERROR_LOG(FILESYS, "Unknown directory type.");
-		return g_Config.memCardDirectory;
+		return g_Config.memStickDirectory;
 	}
 }
 
-#if defined(_WIN32) && !defined(_XBOX)
+#if defined(_WIN32)
 // Run this at startup time. Please use GetSysDirectory if you need to query where folders are.
 void InitSysDirectories() {
-	if (!g_Config.memCardDirectory.empty() && !g_Config.flash0Directory.empty())
+	if (!g_Config.memStickDirectory.empty() && !g_Config.flash0Directory.empty())
 		return;
 
 	const std::string path = File::GetExeDirectory();
@@ -525,38 +570,38 @@ void InitSysDirectories() {
 			if (tempString.substr(0, 3) == "\xEF\xBB\xBF")
 				tempString = tempString.substr(3);
 
-			g_Config.memCardDirectory = tempString;
+			g_Config.memStickDirectory = tempString;
 		}
 		inputFile.close();
 
 		// Check if the file is empty first, before appending the slash.
-		if (g_Config.memCardDirectory.empty())
-			g_Config.memCardDirectory = myDocsPath;
+		if (g_Config.memStickDirectory.empty())
+			g_Config.memStickDirectory = myDocsPath;
 
-		size_t lastSlash = g_Config.memCardDirectory.find_last_of("/");
-		if (lastSlash != (g_Config.memCardDirectory.length() - 1))
-			g_Config.memCardDirectory.append("/");
+		size_t lastSlash = g_Config.memStickDirectory.find_last_of("/");
+		if (lastSlash != (g_Config.memStickDirectory.length() - 1))
+			g_Config.memStickDirectory.append("/");
 	} else {
-		g_Config.memCardDirectory = path + "memstick/";
+		g_Config.memStickDirectory = path + "memstick/";
 	}
 
 	// Create the memstickpath before trying to write to it, and fall back on Documents yet again
 	// if we can't make it.
-	if (!File::Exists(g_Config.memCardDirectory)) {
-		if (!File::CreateDir(g_Config.memCardDirectory))
-			g_Config.memCardDirectory = myDocsPath;
+	if (!File::Exists(g_Config.memStickDirectory)) {
+		if (!File::CreateDir(g_Config.memStickDirectory))
+			g_Config.memStickDirectory = myDocsPath;
 	}
 
 	const std::string testFile = "/_writable_test.$$$";
 
 	// If any directory is read-only, fall back to the Documents directory.
 	// We're screwed anyway if we can't write to Documents, or can't detect it.
-	if (!File::CreateEmptyFile(g_Config.memCardDirectory + testFile))
-		g_Config.memCardDirectory = myDocsPath;
+	if (!File::CreateEmptyFile(g_Config.memStickDirectory + testFile))
+		g_Config.memStickDirectory = myDocsPath;
 
 	// Clean up our mess.
-	if (File::Exists(g_Config.memCardDirectory + testFile))
-		File::Delete(g_Config.memCardDirectory + testFile);
+	if (File::Exists(g_Config.memStickDirectory + testFile))
+		File::Delete(g_Config.memStickDirectory + testFile);
 
 	if (g_Config.currentDirectory.empty()) {
 		g_Config.currentDirectory = GetSysDirectory(DIRECTORY_GAME);

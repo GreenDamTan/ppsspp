@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include <map>
+
 #include "gfx_es2/fbo.h"
 #include "gfx_es2/gpu_features.h"
 
@@ -24,6 +26,7 @@
 #include "GPU/GPUInterface.h"
 #include "GPU/GPUState.h"
 #include "GPU/GLES/TextureScaler.h"
+#include "GPU/Common/TextureCacheCommon.h"
 
 struct VirtualFramebuffer;
 class FramebufferManager;
@@ -51,13 +54,13 @@ inline bool UseBGRA8888() {
 	return false;
 }
 
-class TextureCache {
+class TextureCache : public TextureCacheCommon {
 public:
 	TextureCache();
 	~TextureCache();
 
 	void SetTexture(bool force = false);
-	bool SetOffsetTexture(u32 offset);
+	virtual bool SetOffsetTexture(u32 offset) override;
 
 	void Clear(bool delete_them);
 	void StartFrame();
@@ -92,7 +95,7 @@ public:
 	u32 AllocTextureName();
 
 	// Only used by Qt UI?
-	bool DecodeTexture(u8 *output, GPUgstate state);
+	bool DecodeTexture(u8 *output, const GPUgstate &state);
 
 	// Wow this is starting to grow big. Soon need to start looking at resizing it.
 	// Must stay a POD.
@@ -170,6 +173,7 @@ public:
 	void SetFramebufferSamplingParams(u16 bufferWidth, u16 bufferHeight);
 
 private:
+	// Can't be unordered_map, we use lower_bound ... although for some reason that compiles on MSVC.
 	typedef std::map<u64, TexCacheEntry> TexCache;
 
 	void Decimate();  // Run this once per frame to get rid of old textures.
@@ -181,7 +185,7 @@ private:
 	void LoadTextureLevel(TexCacheEntry &entry, int level, bool replaceImages, int scaleFactor, GLenum dstFmt);
 	GLenum GetDestFormat(GETextureFormat format, GEPaletteFormat clutFormat) const;
 	void *DecodeTextureLevel(GETextureFormat format, GEPaletteFormat clutformat, int level, u32 &texByteAlign, GLenum dstFmt, int *bufw = 0);
-	TexCacheEntry::Status CheckAlpha(u32 *pixelData, GLenum dstFmt, int stride, int w, int h);
+	TexCacheEntry::Status CheckAlpha(const u32 *pixelData, GLenum dstFmt, int stride, int w, int h);
 	template <typename T>
 	const T *GetCurrentClut();
 	u32 GetCurrentClutHash();
@@ -196,6 +200,8 @@ private:
 	TexCache secondCache;
 	std::vector<VirtualFramebuffer *> fbCache_;
 	std::vector<u32> nameCache_;
+	u32 cacheSizeEstimate_;
+	u32 secondCacheSizeEstimate_;
 
 	// Separate to keep main texture cache size down.
 	struct AttachedFramebufferInfo {
@@ -208,7 +214,8 @@ private:
 
 	bool clearCacheNextFrame_;
 	bool lowMemoryMode_;
-	TextureScaler scaler;
+
+	TextureScalerGL scaler;
 
 	SimpleBuf<u32> tmpTexBuf32;
 	SimpleBuf<u16> tmpTexBuf16;
@@ -221,6 +228,7 @@ private:
 	u32 *clutBuf_;
 	u32 clutHash_;
 	u32 clutTotalBytes_;
+	u32 clutMaxBytes_;
 	// True if the clut is just alpha values in the same order (RGBA4444-bit only.)
 	bool clutAlphaLinear_;
 	u16 clutAlphaLinearColor_;
